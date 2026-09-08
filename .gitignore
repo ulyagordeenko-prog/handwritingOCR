@@ -1,0 +1,36 @@
+# Credentials
+server_access.txt
+*.pem
+*.key
+
+# Personal documents: the stamp photos are passport pages with a real
+# address and surname on them, and anything committed stays in git
+# history forever even after deletion
+stamp*.jpg
+photo_*.jpg
+
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Data and models -- gigabytes, all re-downloadable
+real_data/
+synth_data/
+synth_stamp_data/
+page_data/
+corpus/
+models/
+eval_data/
+eval_lines/
+
+# Research tooling and raw experiment output -- the repo is the app
+scripts/
+server_results/
+deepseek_out/
+*.log
+*.tar.gz
+
+# Keep only the adapter the app actually loads
+checkpoints/*
+!checkpoints/trocr-lora-v5/

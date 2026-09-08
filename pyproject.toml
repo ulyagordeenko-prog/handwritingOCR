@@ -1,0 +1,37 @@
+[project]
+name = "ocr-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.14.0",
+    "datasets>=5.0.1",
+    "huggingface-hub>=1.28.0",
+    "paramiko>=5.0.0",
+    "peft>=0.20.0",
+    "pillow>=12.3.0",
+    "protobuf>=7.36.0",
+    "rapidfuzz>=3.14.5",
+    "requests>=2.34.2",
+    "scipy>=1.17.1",
+    "sentencepiece>=0.2.2",
+    "shiftlab-ocr>=0.3.2",
+    "torch>=2.5.1",
+    "transformers>=5.15.1",
+]
+
+[project.scripts]
+ocr-project = "ocr_project:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
