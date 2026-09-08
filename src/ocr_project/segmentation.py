@@ -174,8 +174,21 @@ def segment_lines(image_bgr, target_width=1400, margin_frac=0.1, pad_frac=0.006)
     # Real photos rarely have a profile that drops to zero between lines
     # (cursive ascenders/descenders, rule-line bleed), so find line centers
     # as peaks rather than thresholding for empty bands.
-    min_distance = max(8, int(small.shape[0] * 0.02))
-    peaks, _ = find_peaks(smoothed, distance=min_distance, prominence=smoothed.max() * 0.15)
+    #
+    # The minimum spacing is measured from the text itself rather than taken
+    # as a fraction of the image height: on a tightly-spaced form the
+    # height-based figure was larger than the real line pitch and merged
+    # rows in pairs, so every second line vanished into its neighbour.
+    prominence = smoothed.max() * 0.15
+    loose, _ = find_peaks(smoothed, distance=max(3, int(small.shape[0] * 0.004)),
+                          prominence=prominence)
+    if len(loose) > 2:
+        pitch = float(np.median(np.diff(loose)))
+        min_distance = max(3, int(pitch * 0.6))
+    else:
+        min_distance = max(8, int(small.shape[0] * 0.02))
+
+    peaks, _ = find_peaks(smoothed, distance=min_distance, prominence=prominence)
 
     if len(peaks) == 0:
         return []
