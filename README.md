@@ -4,65 +4,38 @@
 картинкой, под ней — распознанный текст в редактируемом поле, покрашенный
 по уверенности модели. Работает офлайн, всё считается на вашем компьютере.
 
-## Установка
+## Установка на Windows
 
-Нужен Python 3.11+. Видеокарта NVIDIA желательна, но не обязательна —
-без неё работает медленнее.
+Скачайте проект: зелёная кнопка **Code → Download ZIP**, распакуйте.
+Затем в распакованной папке:
 
-```bash
-git clone <адрес репозитория>
-cd ocr_project
-```
+1. Двойной клик по **`install.bat`** — поставит всё необходимое.
+   Занимает 10-20 минут, нужен интернет. Запускается один раз.
+2. Двойной клик по **`start.bat`** — откроет приложение.
 
-Установить менеджер пакетов uv, если его ещё нет:
+Всё. Ничего вводить в командной строке не нужно.
 
-```bash
-# Windows
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-# Linux / macOS
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
+При самом первом запуске приложение докачивает модель распознавания
+(1.3 ГБ), поэтому окно появится через несколько минут. Дальше — за секунды.
 
-Поставить зависимости:
+Нажмите «Открыть фото» и выберите изображение. Для пробы в папке лежит
+`test_page.jpg`.
+
+## Установка вручную (Linux, macOS или если хочется через терминал)
 
 ```bash
-uv sync
+git clone https://github.com/ulyagordeenko-prog/handwritingOCR.git
+cd handwritingOCR
+
+curl -LsSf https://astral.sh/uv/install.sh | sh   # менеджер пакетов uv
+uv sync                                           # библиотеки
+uv run python setup_language_model.py             # языковая модель, 529 МБ
+uv run python run_app.py                          # запуск
 ```
 
-## Языковая модель (необязательно, но заметно улучшает результат)
-
-Приложение работает и без неё, но с ней выбирает более осмысленный вариант
-из нескольких прочтений строки. Скачивание — 529 МБ, один раз:
-
-```bash
-uv run python -c "
-import torch, os, shutil
-from huggingface_hub import snapshot_download
-from safetensors.torch import save_file
-
-d = snapshot_download('ai-forever/rugpt3small_based_on_gpt2',
-                      allow_patterns=['*.json','*.txt','pytorch_model.bin'])
-sd = torch.load(os.path.join(d, 'pytorch_model.bin'), map_location='cpu', weights_only=True)
-sd = {k: v.contiguous() for k, v in sd.items()}
-sd.pop('lm_head.weight', None)
-os.makedirs('models/rugpt3small', exist_ok=True)
-save_file(sd, 'models/rugpt3small/model.safetensors')
-for f in os.listdir(d):
-    if f != 'pytorch_model.bin':
-        shutil.copy(os.path.join(d, f), 'models/rugpt3small/')
-"
-```
-
-Модель распознавания (TrOCR-ru, 1.3 ГБ) скачается сама при первом запуске.
-
-## Запуск
-
-```bash
-uv run python run_app.py
-```
-
-Нажмите «Открыть фото» и выберите изображение. Для пробы в репозитории лежит
-`test_page.jpg`. Первый запуск дольше — скачивается базовая модель.
+Языковая модель необязательна — без неё приложение работает, просто выбирает
+вариант прочтения чуть хуже. Видеокарта NVIDIA тоже необязательна: без неё
+считает на процессоре, медленнее.
 
 ## Как читать результат
 
