@@ -143,6 +143,12 @@ class HandwritingApp(tk.Tk):
         self.status.set(f"Готово ({adapter}, {where}). Откройте фото страницы.")
         self.open_btn.configure(state=tk.NORMAL)
 
+        # Explain the fall back to CPU once, up front -- otherwise the only
+        # symptom is that every page takes several minutes for no visible
+        # reason.
+        if getattr(recognizer, "device_warning", None):
+            messagebox.showwarning("Видеокарта не используется", recognizer.device_warning)
+
     def _model_failed(self, exc: Exception):
         self.status.set("Не удалось загрузить модель")
         messagebox.showerror("Ошибка загрузки модели", str(exc))

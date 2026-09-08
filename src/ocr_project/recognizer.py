@@ -34,6 +34,36 @@ class RecognizedLine:
     image: np.ndarray  # BGR crop, for showing the original beside the text
 
 
+def _usable_device() -> tuple[str, str | None]:
+    """Pick cuda only if this build can actually run on this card.
+
+    torch.cuda.is_available() answers "is there a driver and a GPU", not
+    "was this wheel compiled for this GPU". A card newer or older than the
+    wheel's compiled architectures passes that check and then dies at the
+    first real kernel launch with "no kernel image is available for
+    execution on the device". Launching a tiny op here turns that crash
+    mid-page into a quiet fall back to CPU.
+
+    Returns (device, warning) -- warning is None when all is well.
+    """
+    if not torch.cuda.is_available():
+        return "cpu", None
+    try:
+        torch.zeros(8, device="cuda").sum().item()
+        return "cuda", None
+    except Exception as exc:
+        name = "неизвестная"
+        try:
+            name = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+        return "cpu", (
+            f"Видеокарта {name} не поддерживается установленной версией PyTorch "
+            f"({torch.__version__}), поэтому распознавание идёт на процессоре — "
+            f"это работает, но медленнее.\n\nПодробность: {exc}"
+        )
+
+
 class Recognizer:
     def __init__(
         self,
@@ -41,7 +71,10 @@ class Recognizer:
         device: str | None = None,
         use_language_model: bool = True,
     ):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device:
+            self.device, self.device_warning = device, None
+        else:
+            self.device, self.device_warning = _usable_device()
         self.processor = TrOCRProcessor.from_pretrained(BASE_MODEL_ID)
         model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL_ID)
 
