@@ -1,10 +1,12 @@
 """
-Desktop app: photo -> lines -> text.
+Desktop app: photo -> text.
 
-Layout mirrors how a person proofreads: every recognized line sits directly
-under the actual image strip it came from, and lines the model was unsure
-about are tinted so the eye lands on them first. Text fields are editable,
-so correcting a mistake and exporting a clean transcript is one flow.
+The page sits on the left and its transcription on the right, the way a
+person proofreads. Two engines feed it: the line recognizer, which cuts the
+page into lines and tints each by how sure it was, and Qwen3-VL, which
+reads the whole photo in one pass -- more accurate, but it needs a card
+with about 8 GB. Text is editable, so fixing a mistake and exporting a
+clean transcript is one flow.
 """
 from __future__ import annotations
 
@@ -15,9 +17,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
-from .recognizer import Recognizer
+from . import page_reader
+from .recognizer import RecognizedLine, Recognizer
 
 # Confidence below this is treated as "look at this one".
 LOW_CONFIDENCE = 0.80
@@ -27,7 +31,6 @@ COLOR_LOW = "#ffd9d9"
 COLOR_MEDIUM = "#fff3cd"
 COLOR_OK = "#ffffff"
 
-MAX_STRIP_WIDTH = 900
 
 
 def confidence_color(confidence: float) -> str:
@@ -45,8 +48,7 @@ class HandwritingApp(tk.Tk):
         self.geometry("1150x800")
 
         self.recognizer: Recognizer | None = None
-        self.line_widgets: list[tuple[tk.Text, float]] = []
-        self._photo_refs: list[ImageTk.PhotoImage] = []
+        self.page_reader: page_reader.PageReader | None = None
 
         # Worker threads must not touch tkinter (not even via .after());
         # they post messages here and the main thread drains the queue.
@@ -71,6 +73,8 @@ class HandwritingApp(tk.Tk):
                     self._show_results(*payload)
                 elif kind == "recognize_failed":
                     self._recognize_failed(payload)
+                elif kind == "status":
+                    self.status.set(payload)
                 elif kind == "progress":
                     self._update_progress(*payload)
         except queue.Empty:
@@ -90,6 +94,16 @@ class HandwritingApp(tk.Tk):
         self.copy_btn = ttk.Button(bar, text="Копировать всё", command=self.on_copy, state=tk.DISABLED)
         self.copy_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        # Whole-page mode reads the photo in one go and is more accurate,
+        # but needs a card with ~8 GB; the line mode runs anywhere.
+        self.whole_page = tk.BooleanVar(value=page_reader.enough_vram())
+        self.mode_check = ttk.Checkbutton(
+            bar, text="читать страницу целиком (точнее)", variable=self.whole_page
+        )
+        self.mode_check.pack(side=tk.LEFT, padx=(16, 0))
+        if not page_reader.enough_vram():
+            self.mode_check.state(["disabled"])
+
         self.status = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.status).pack(side=tk.LEFT, padx=(16, 0))
 
@@ -97,6 +111,7 @@ class HandwritingApp(tk.Tk):
         # sits there looking hung.
         self.progress = ttk.Progressbar(bar, mode="determinate", length=160)
         self.progress.pack(side=tk.LEFT, padx=(16, 0))
+        self.progress.stop()
         self.progress.pack_forget()
 
         legend = ttk.Frame(bar)
@@ -107,26 +122,36 @@ class HandwritingApp(tk.Tk):
             swatch.pack(side=tk.LEFT, padx=2)
 
     def _build_body(self):
-        container = ttk.Frame(self)
-        container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        # Page on the left, its transcription on the right -- the line strips
+        # this used to show one under another mirrored how the recognizer
+        # works internally, not how anyone wants to proofread a page.
+        panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        self.canvas = tk.Canvas(container, background="#f5f5f5", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.inner = ttk.Frame(self.canvas)
-
-        self.inner.bind(
-            "<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
+        left = ttk.Frame(panes)
+        self.canvas = tk.Canvas(left, background="#f5f5f5", highlightthickness=0)
+        canvas_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=canvas_scroll.set)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        panes.add(left, weight=1)
 
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        right = ttk.Frame(panes)
+        self.text = tk.Text(right, wrap=tk.WORD, font=("Segoe UI", 11),
+                            padx=8, pady=8, undo=True)
+        text_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.text.yview)
+        self.text.configure(yscrollcommand=text_scroll.set)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        panes.add(right, weight=1)
 
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+        # Confidence is shown by tinting whole lines in place, so the text
+        # stays one editable block you can select and copy across.
+        self.text.tag_configure("low", background=COLOR_LOW)
+        self.text.tag_configure("medium", background=COLOR_MEDIUM)
+
+        self._page_photo = None
+        self.canvas.bind("<Configure>", lambda e: self._redraw_page())
 
     def _load_model(self):
         try:
@@ -161,12 +186,14 @@ class HandwritingApp(tk.Tk):
         if not path:
             return
 
-        for child in self.inner.winfo_children():
-            child.destroy()
-        self.line_widgets.clear()
-        self._photo_refs.clear()
+        self.text.delete("1.0", tk.END)
+        data = np.fromfile(path, dtype=np.uint8)
+        self._page_image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        self._redraw_page()
 
-        self.status.set("Поиск строк…")
+        self.status.set(
+            "Читаю страницу целиком…" if self.whole_page.get() else "Поиск строк…"
+        )
         self.open_btn.configure(state=tk.DISABLED)
         self.save_btn.configure(state=tk.DISABLED)
         self.copy_btn.configure(state=tk.DISABLED)
@@ -176,25 +203,66 @@ class HandwritingApp(tk.Tk):
 
     def _recognize(self, path: str):
         try:
-            lines = self.recognizer.recognize_file(
-                path, progress=lambda done, total: self._events.put(("progress", (done, total)))
-            )
+            if self.whole_page.get():
+                lines = self._read_whole_page(path)
+            else:
+                lines = self.recognizer.recognize_file(
+                    path, progress=lambda done, total: self._events.put(("progress", (done, total)))
+                )
         except Exception as exc:
             self._events.put(("recognize_failed", exc))
             return
         self._events.put(("recognized", (os.path.basename(path), lines)))
 
+    def _read_whole_page(self, path: str):
+        """Qwen3-VL reads the page in one pass, so there is no per-line
+        confidence to colour by -- every line comes back unmarked."""
+        if self.page_reader is None:
+            self._events.put(("progress", (0, 1)))
+            self.status_from_worker("Загружаю модель чтения страницы (в первый раз качается ~6 ГБ)…")
+            self.page_reader = page_reader.PageReader()
+        self._events.put(("progress", (0, 1)))
+        texts = self.page_reader.read_file(path)
+        self._events.put(("progress", (1, 1)))
+        return [
+            RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
+            for i, t in enumerate(texts)
+        ]
+
+    def status_from_worker(self, message: str):
+        self._events.put(("status", message))
+
     def _update_progress(self, done: int, total: int):
+        # Whole-page mode has nothing to count -- one call in, one answer
+        # out -- so it gets a marching bar instead of a filling one.
+        if self.whole_page.get():
+            if str(self.progress["mode"]) != "indeterminate":
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            return
+        if str(self.progress["mode"]) != "determinate":
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
         self.progress.configure(value=done, maximum=max(total, 1))
         self.status.set(f"Распознавание… строка {done} из {total}")
 
     def _recognize_failed(self, exc: Exception):
+        self.progress.stop()
         self.progress.pack_forget()
         self.status.set("Ошибка распознавания")
         self.open_btn.configure(state=tk.NORMAL)
-        messagebox.showerror("Ошибка распознавания", str(exc))
+        if "out of memory" in str(exc).lower():
+            messagebox.showerror(
+                "Не хватило видеопамяти",
+                "Чтение страницы целиком не поместилось в видеокарту.\n\n"
+                "Снимите галочку «читать страницу целиком» и откройте фото "
+                "заново — построчный режим требует намного меньше памяти.",
+            )
+        else:
+            messagebox.showerror("Ошибка распознавания", str(exc))
 
     def _show_results(self, filename: str, lines):
+        self.progress.stop()
         self.progress.pack_forget()
         if not lines:
             self.status.set(f"{filename}: строки не найдены")
@@ -202,56 +270,51 @@ class HandwritingApp(tk.Tk):
             return
 
         flagged = sum(1 for line in lines if line.confidence < MEDIUM_CONFIDENCE)
-        for line in lines:
-            self._add_line_row(line)
+        whole = self.whole_page.get()
+        self.text.delete("1.0", tk.END)
+        for i, line in enumerate(lines, start=1):
+            self.text.insert(tk.END, line.text + "\n")
+            if line.confidence < LOW_CONFIDENCE:
+                self.text.tag_add("low", f"{i}.0", f"{i}.end")
+            elif line.confidence < MEDIUM_CONFIDENCE:
+                self.text.tag_add("medium", f"{i}.0", f"{i}.end")
 
-        self.status.set(
-            f"{filename}: строк {len(lines)}, требуют проверки {flagged}"
-        )
+        if whole:
+            self.status.set(f"{filename}: строк {len(lines)} (страница целиком)")
+        else:
+            self.status.set(f"{filename}: строк {len(lines)}, требуют проверки {flagged}")
         self.open_btn.configure(state=tk.NORMAL)
         self.save_btn.configure(state=tk.NORMAL)
         self.copy_btn.configure(state=tk.NORMAL)
 
+    def _redraw_page(self):
+        """Fit the page into the left pane, keeping its proportions."""
+        image = getattr(self, "_page_image", None)
+        if image is None:
+            return
+        avail_w = max(self.canvas.winfo_width(), 1)
+        avail_h = max(self.canvas.winfo_height(), 1)
+        h, w = image.shape[:2]
+        scale = min(avail_w / w, avail_h / h)
+        if scale <= 0:
+            return
+        pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+
+        # keep a reference or tkinter garbage-collects the image away
+        self._page_photo = ImageTk.PhotoImage(pil)
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=self._page_photo)
+        self.canvas.configure(scrollregion=(0, 0, pil.width, pil.height))
+
     def _current_text(self) -> str:
-        return "\n".join(widget.get("1.0", tk.END).strip() for widget, _ in self.line_widgets)
+        return self.text.get("1.0", tk.END).strip()
 
     def on_copy(self):
         self.clipboard_clear()
         self.clipboard_append(self._current_text())
-        self.status.set(f"Скопировано строк: {len(self.line_widgets)}")
-
-    def _add_line_row(self, line):
-        row = ttk.Frame(self.inner, padding=(0, 6))
-        row.pack(fill=tk.X, expand=True, anchor="w")
-
-        rgb = cv2.cvtColor(line.image, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-        if pil.width > MAX_STRIP_WIDTH:
-            ratio = MAX_STRIP_WIDTH / pil.width
-            pil = pil.resize((MAX_STRIP_WIDTH, max(1, int(pil.height * ratio))), Image.LANCZOS)
-        photo = ImageTk.PhotoImage(pil)
-        self._photo_refs.append(photo)
-
-        tk.Label(row, image=photo, borderwidth=1, relief=tk.SOLID).pack(anchor="w")
-
-        entry_row = ttk.Frame(row)
-        entry_row.pack(fill=tk.X, anchor="w", pady=(3, 0))
-
-        tk.Label(entry_row, text=f"{line.confidence * 100:.0f}%", width=5, anchor="e").pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-
-        text = tk.Text(
-            entry_row,
-            height=1,
-            wrap=tk.NONE,
-            background=confidence_color(line.confidence),
-            font=("Segoe UI", 11),
-        )
-        text.insert("1.0", line.text)
-        text.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        self.line_widgets.append((text, line.confidence))
+        lines = len(self._current_text().splitlines())
+        self.status.set(f"Скопировано строк: {lines}")
 
     def on_save(self):
         path = filedialog.asksaveasfilename(
