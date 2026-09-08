@@ -71,6 +71,8 @@ class HandwritingApp(tk.Tk):
                     self._show_results(*payload)
                 elif kind == "recognize_failed":
                     self._recognize_failed(payload)
+                elif kind == "progress":
+                    self._update_progress(*payload)
         except queue.Empty:
             pass
         self.after(50, self._drain_events)
@@ -85,8 +87,17 @@ class HandwritingApp(tk.Tk):
         self.save_btn = ttk.Button(bar, text="Сохранить текст", command=self.on_save, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=(8, 0))
 
+        self.copy_btn = ttk.Button(bar, text="Копировать всё", command=self.on_copy, state=tk.DISABLED)
+        self.copy_btn.pack(side=tk.LEFT, padx=(8, 0))
+
         self.status = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.status).pack(side=tk.LEFT, padx=(16, 0))
+
+        # A page takes roughly two minutes; without this the window just
+        # sits there looking hung.
+        self.progress = ttk.Progressbar(bar, mode="determinate", length=160)
+        self.progress.pack(side=tk.LEFT, padx=(16, 0))
+        self.progress.pack_forget()
 
         legend = ttk.Frame(bar)
         legend.pack(side=tk.RIGHT)
@@ -149,25 +160,36 @@ class HandwritingApp(tk.Tk):
         self.line_widgets.clear()
         self._photo_refs.clear()
 
-        self.status.set("Распознавание…")
+        self.status.set("Поиск строк…")
         self.open_btn.configure(state=tk.DISABLED)
         self.save_btn.configure(state=tk.DISABLED)
+        self.copy_btn.configure(state=tk.DISABLED)
+        self.progress.pack(side=tk.LEFT, padx=(16, 0))
+        self.progress.configure(value=0, maximum=100)
         threading.Thread(target=self._recognize, args=(path,), daemon=True).start()
 
     def _recognize(self, path: str):
         try:
-            lines = self.recognizer.recognize_file(path)
+            lines = self.recognizer.recognize_file(
+                path, progress=lambda done, total: self._events.put(("progress", (done, total)))
+            )
         except Exception as exc:
             self._events.put(("recognize_failed", exc))
             return
         self._events.put(("recognized", (os.path.basename(path), lines)))
 
+    def _update_progress(self, done: int, total: int):
+        self.progress.configure(value=done, maximum=max(total, 1))
+        self.status.set(f"Распознавание… строка {done} из {total}")
+
     def _recognize_failed(self, exc: Exception):
+        self.progress.pack_forget()
         self.status.set("Ошибка распознавания")
         self.open_btn.configure(state=tk.NORMAL)
         messagebox.showerror("Ошибка распознавания", str(exc))
 
     def _show_results(self, filename: str, lines):
+        self.progress.pack_forget()
         if not lines:
             self.status.set(f"{filename}: строки не найдены")
             self.open_btn.configure(state=tk.NORMAL)
@@ -182,6 +204,15 @@ class HandwritingApp(tk.Tk):
         )
         self.open_btn.configure(state=tk.NORMAL)
         self.save_btn.configure(state=tk.NORMAL)
+        self.copy_btn.configure(state=tk.NORMAL)
+
+    def _current_text(self) -> str:
+        return "\n".join(widget.get("1.0", tk.END).strip() for widget, _ in self.line_widgets)
+
+    def on_copy(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._current_text())
+        self.status.set(f"Скопировано строк: {len(self.line_widgets)}")
 
     def _add_line_row(self, line):
         row = ttk.Frame(self.inner, padding=(0, 6))
@@ -225,7 +256,7 @@ class HandwritingApp(tk.Tk):
         if not path:
             return
 
-        content = "\n".join(widget.get("1.0", tk.END).strip() for widget, _ in self.line_widgets)
+        content = self._current_text()
         with open(path, "w", encoding="utf-8") as f:
             f.write(content + "\n")
         self.status.set(f"Сохранено: {os.path.basename(path)}")
