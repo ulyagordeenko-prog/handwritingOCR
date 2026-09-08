@@ -18,7 +18,7 @@ echo При первом запуске скачивается модель ра
 echo окно появится через несколько минут. Дальше будет быстро.
 echo.
 
-uv run python run_app.py
+uv run --no-sync python run_app.py
 if errorlevel 1 (
     echo.
     echo Приложение завершилось с ошибкой.

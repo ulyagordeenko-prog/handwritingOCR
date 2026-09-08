@@ -17,7 +17,7 @@ echo.
 pause
 echo.
 
-uv run python setup_torch.py
+uv run --no-sync python setup_torch.py
 
 echo.
 pause
