@@ -38,9 +38,15 @@ ROOT = Path(__file__).resolve().parent
 # down the list until it reaches one still compiled for its architecture
 CHANNELS = ["cu129", "cu128", "cu126", "cu121"]
 
+# torchvision ships compiled extensions linked against one exact torch build,
+# so a torch upgrade that leaves it behind produces a DLL entry-point error at
+# import time -- and a probe that only touched torch reported success while the
+# environment was in fact broken. Importing it here makes the mismatch a failed
+# probe, which is what drives the search to the next channel.
 PROBE = (
-    "import torch;"
+    "import importlib.util, torch;"
     "torch.zeros(8, device='cuda').sum().item();"
+    "importlib.util.find_spec('torchvision') and __import__('torchvision');"
     "print('OK', torch.__version__, torch.cuda.get_device_name(0))"
 )
 
@@ -77,7 +83,17 @@ def ask(expression: str) -> str:
 
 def install(channel: str) -> bool:
     print("    качаю сборку (около 2.5 ГБ)...", flush=True)
-    result = run([uv(), "pip", "install", "--reinstall-package", "torch", "torch",
+    # torchvision must move with torch, from the same channel: leaving the old
+    # one in place is what broke the first working install on a 50-series card.
+    #
+    # The lower bound on torchvision is load-bearing. Unconstrained, the resolver
+    # is free to satisfy "torchvision" with the 2018-era 0.2.0 sdist that also
+    # lives on the index, and happily pairs it with a 2026 torch -- a resolution
+    # that installs cleanly and then fails at import. Pinning the floor forces it
+    # onto the matched +cuXXX wheel built against the torch it ships beside.
+    result = run([uv(), "pip", "install",
+                  "--reinstall-package", "torch", "--reinstall-package", "torchvision",
+                  "torch", "torchvision>=0.20",
                   "--index-url", f"https://download.pytorch.org/whl/{channel}"])
     if result.returncode != 0:
         tail = (result.stderr.strip().splitlines() or [""])[-1]

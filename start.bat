@@ -17,7 +17,10 @@ REM Приложение запускается с --no-sync, иначе uv ка
 REM окружение к версии PyTorch из настроек проекта и отменяет сборку,
 REM подобранную под видеокарту. Но --no-sync означает и то, что нехватку
 REM библиотек никто не починит сам, поэтому сначала короткая проверка.
-uv run --no-sync python -c "import cv2, torch, transformers, PIL, scipy" >nul 2>&1
+REM torchvision входит в проверку намеренно: оно грузится не при старте
+REM приложения, а позже, когда TrOCR разбирает картинку, и рассогласованное
+REM с torch падает окном про "точка входа не найдена" уже после запуска.
+uv run --no-sync python -c "import cv2, torch, transformers, PIL, scipy, importlib.util; importlib.util.find_spec('torchvision') and __import__('torchvision')" >nul 2>&1
 if errorlevel 1 (
     echo Не хватает библиотек, доустанавливаю. Это разовая задержка...
     uv sync
