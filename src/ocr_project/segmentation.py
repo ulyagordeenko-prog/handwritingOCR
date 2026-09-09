@@ -214,3 +214,96 @@ def segment_lines(image_bgr, target_width=1400, margin_frac=0.1, pad_frac=0.006)
             continue
         crops.append(((0, top, w0, bottom), image_bgr[top:bottom, 0:w0]))
     return crops
+
+
+def crop_to_page(image_bgr, min_area_frac=0.25, max_area_frac=0.98, pad_frac=0.01):
+    """
+    Trim the desk, fingers and shadow around the sheet, keeping only the paper.
+
+    This is not cosmetic. A vision model converts the picture into a fixed
+    budget of visual tokens, so every pixel of desk is budget not spent on
+    handwriting -- cropping is free resolution.
+
+    Deliberately timid: the crop is accepted only when a bright, roughly
+    rectangular region covers a plausible share of the frame. A photo that is
+    already all paper (the common case) has no boundary to find, and a wrong
+    crop would cut off text -- far worse than not cropping at all.
+    """
+    h0, w0 = image_bgr.shape[:2]
+    probe_width = 800
+    scale = probe_width / w0
+    small = cv2.resize(image_bgr, (probe_width, int(h0 * scale)), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Paper is the bright part; Otsu finds the paper/surroundings cut when one
+    # exists and degenerates harmlessly into "almost everything" when it doesn't
+    # -- which the area guard below then rejects.
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return image_bgr, False
+
+    x, y, w, h = cv2.boundingRect(max(contours, key=cv2.contourArea))
+    area_frac = (w * h) / (small.shape[0] * small.shape[1])
+    if not (min_area_frac < area_frac < max_area_frac):
+        return image_bgr, False
+
+    # Keep a small margin: ascenders and the first/last stroke of a line often
+    # sit just outside the detected paper blob.
+    pad = int(max(small.shape) * pad_frac)
+    x, y = max(0, x - pad), max(0, y - pad)
+    w = min(small.shape[1] - x, w + 2 * pad)
+    h = min(small.shape[0] - y, h + 2 * pad)
+
+    left, top = int(x / scale), int(y / scale)
+    right, bottom = min(w0, int((x + w) / scale)), min(h0, int((y + h) / scale))
+    if right - left < w0 * 0.3 or bottom - top < h0 * 0.3:
+        return image_bgr, False
+    return image_bgr[top:bottom, left:right], True
+
+
+def split_strips(image_bgr, count, min_gap_rows=6):
+    """
+    Cut a page into `count` horizontal strips, placing every cut on a boundary
+    the line finder already identified, never at a fixed height.
+
+    A fixed cut lands mid-line as often as not, and a line sliced in half is
+    unreadable in both halves -- the split would cost more than the added
+    resolution gains. Two weaker versions of this were measured and rejected:
+    picking the quietest row within a window of the ideal position put one cut
+    on a row carrying 127 ink pixels against a page average of 156 (i.e.
+    through text), and averaging the profile over a band made it worse (211),
+    because in a densely written region no quiet row exists to find. Asking
+    segment_lines() where the lines actually are removes the guesswork: the cut
+    goes on a real boundary, however far that sits from the ideal position.
+    """
+    if count < 2:
+        return [image_bgr]
+
+    crops = segment_lines(image_bgr)
+    h0 = image_bgr.shape[0]
+    # Midway between two consecutive line centres -- the point furthest from
+    # both. The crop boundaries themselves are not good enough: they carry the
+    # padding segment_lines adds and sit where uneven spacing puts them, which
+    # measured as little as 0.32 of a line pitch from a line centre, close
+    # enough to clip descenders.
+    centres = [(bbox[1] + bbox[3]) // 2 for bbox, _ in crops]
+    boundaries = [(a + b) // 2 for a, b in zip(centres[:-1], centres[1:])]
+    if not boundaries:
+        return [image_bgr]
+
+    cuts = []
+    for i in range(1, count):
+        ideal = h0 * i / count
+        best = min(boundaries, key=lambda y: abs(y - ideal))
+        # two strips must not share a boundary, and a sliver is not a strip
+        if all(abs(best - c) > min_gap_rows for c in cuts):
+            cuts.append(best)
+
+    bounds = [0] + sorted(cuts) + [h0]
+    strips = [image_bgr[a:b] for a, b in zip(bounds[:-1], bounds[1:]) if b - a > 10]
+    return strips or [image_bgr]

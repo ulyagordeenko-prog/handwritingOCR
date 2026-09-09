@@ -222,8 +222,9 @@ class HandwritingApp(tk.Tk):
             self.status_from_worker("Загружаю модель чтения страницы (в первый раз качается ~6 ГБ)…")
             self.page_reader = page_reader.PageReader()
         self._events.put(("progress", (0, 1)))
-        texts = self.page_reader.read_file(path)
-        self._events.put(("progress", (1, 1)))
+        texts = self.page_reader.read_file(
+            path, progress=lambda done, total: self._events.put(("progress", (done, total)))
+        )
         return [
             RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
             for i, t in enumerate(texts)

@@ -14,23 +14,46 @@ The weights are ~17 GB in full precision, so they are loaded quantized to
 """
 from __future__ import annotations
 
+import math
+
 import torch
 from PIL import Image
 
+from .segmentation import crop_to_page, deskew, split_strips
+
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 
-# Asking it to mark unreadable spots with a placeholder made it emit
-# hundreds of them in a row on a faded page; telling it to skip such marks
-# instead gives it nothing to loop on.
+# The task is transcription, not comprehension: the model must copy what the
+# strokes say, the way a person reading someone else's handwriting does, and
+# never substitute a word it finds more plausible. Hence the explicit ban on
+# replacing an unclear word with a similar one -- guessing is exactly the
+# failure mode that makes an otherwise low error rate untrustworthy, because a
+# confident wrong word looks the same as a right one.
+#
+# Note what is NOT asked for: marking unreadable spots with a placeholder. That
+# was tried, and on a faded page the model emitted hundreds of them in a row;
+# with nothing to repeat, it stops looping.
 PROMPT = (
-    "Перепиши разборчивый рукописный текст с этого изображения, строка за строкой. "
-    "Переписывай ровно то, что видишь, не исправляя и не додумывая. "
+    "Перепиши рукописный текст с этого изображения, строка за строкой. "
+    "Переписывай ровно то, что видишь, буква за буквой, не исправляя и не додумывая. "
+    "Не заменяй непонятное слово похожим или более подходящим по смыслу — "
+    "пиши то, что видно по буквам, даже если получается странно. "
     "Бледные следы текста, просвечивающие с обратной стороны листа, пропускай. "
     "Ничего не повторяй дважды."
 )
 
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
+
+# Qwen3-VL turns a picture into visual tokens of 32x32 pixels and caps how many
+# it will make. Anything above the cap is downscaled before the model ever looks
+# at it -- our 1935x1960 test photo loses two thirds of its area that way, and
+# no amount of sharpening survives that. Reading the page in horizontal strips
+# keeps each piece under the cap, so the model sees the original pixels.
+MAX_VISUAL_TOKENS = 1280
+PIXELS_PER_TOKEN = 32 * 32
+MAX_PIXELS = MAX_VISUAL_TOKENS * PIXELS_PER_TOKEN
+MAX_STRIPS = 3
 
 
 def enough_vram() -> bool:
@@ -68,7 +91,31 @@ class PageReader:
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
-    def read_page(self, page_bgr, max_new_tokens: int = 1024) -> list[str]:
+    def read_page(self, page_bgr, max_new_tokens: int = 1024, strips: bool = True,
+                  progress=None) -> list[str]:
+        """Read a whole page. With `strips`, the page is cropped to the sheet,
+        straightened, and cut into as many horizontal pieces as it takes to stay
+        under the model's pixel budget -- then each piece is read at full
+        resolution and the results are concatenated in reading order."""
+        if strips:
+            page_bgr, _ = crop_to_page(page_bgr)
+            page_bgr, _ = deskew(page_bgr)
+            h, w = page_bgr.shape[:2]
+            count = min(MAX_STRIPS, max(1, math.ceil((h * w) / MAX_PIXELS)))
+            pieces = split_strips(page_bgr, count)
+        else:
+            pieces = [page_bgr]
+
+        lines: list[str] = []
+        for i, piece in enumerate(pieces):
+            if progress:
+                progress(i, len(pieces))
+            lines.extend(self._read_one(piece, max_new_tokens))
+        if progress:
+            progress(len(pieces), len(pieces))
+        return lines
+
+    def _read_one(self, page_bgr, max_new_tokens: int = 1024) -> list[str]:
         import cv2
 
         image = Image.fromarray(cv2.cvtColor(page_bgr, cv2.COLOR_BGR2RGB))
@@ -89,7 +136,7 @@ class PageReader:
         )[0].strip()
         return [line for line in text.splitlines() if line.strip()]
 
-    def read_file(self, path: str) -> list[str]:
+    def read_file(self, path: str, strips: bool = True, progress=None) -> list[str]:
         import cv2
         import numpy as np
 
@@ -97,4 +144,4 @@ class PageReader:
         image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"не удалось прочитать изображение: {path}")
-        return self.read_page(image)
+        return self.read_page(image, strips=strips, progress=progress)
