@@ -34,3 +34,4 @@ deepseek_out/
 # Keep only the adapter the app actually loads
 checkpoints/*
 !checkpoints/trocr-lora-v5/
+graphify-out/
