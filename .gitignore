@@ -35,3 +35,4 @@ deepseek_out/
 checkpoints/*
 !checkpoints/trocr-lora-v5/
 graphify-out/
+bench/
