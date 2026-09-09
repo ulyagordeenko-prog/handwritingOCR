@@ -19,7 +19,7 @@ import math
 import torch
 from PIL import Image
 
-from .segmentation import crop_to_page, deskew, split_strips
+from .segmentation import crop_to_page, deskew, split_pages, split_strips
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -39,7 +39,10 @@ PROMPT = (
     "Не заменяй непонятное слово похожим или более подходящим по смыслу — "
     "пиши то, что видно по буквам, даже если получается странно. "
     "Бледные следы текста, просвечивающие с обратной стороны листа, пропускай. "
-    "Ничего не повторяй дважды."
+    "Ничего не повторяй дважды. "
+    # The page is read in pieces, so a preamble is not merely noise: it is
+    # repeated once per piece and lands in the middle of the transcript.
+    "Не пиши ничего, кроме самого текста: ни вступлений, ни пояснений."
 )
 
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
@@ -53,7 +56,9 @@ MIN_VRAM_BYTES = 7 * 1024**3
 MAX_VISUAL_TOKENS = 1280
 PIXELS_PER_TOKEN = 32 * 32
 MAX_PIXELS = MAX_VISUAL_TOKENS * PIXELS_PER_TOKEN
-MAX_STRIPS = 3
+# A tall photo needs more pieces than a square one. Three was too few: a
+# 6000x2000 shot still came out downscaled 3.3x, which defeats the purpose.
+MAX_STRIPS = 6
 
 
 def enough_vram() -> bool:
@@ -100,9 +105,15 @@ class PageReader:
         if strips:
             page_bgr, _ = crop_to_page(page_bgr)
             page_bgr, _ = deskew(page_bgr)
-            h, w = page_bgr.shape[:2]
-            count = min(MAX_STRIPS, max(1, math.ceil((h * w) / MAX_PIXELS)))
-            pieces = split_strips(page_bgr, count)
+            pieces = []
+            # An open notebook photographed as a spread must be separated
+            # first. Horizontal strips cut across both pages at once, so each
+            # piece would hold two unrelated columns and the model would read
+            # them as one interleaved text.
+            for page in split_pages(page_bgr):
+                h, w = page.shape[:2]
+                count = min(MAX_STRIPS, max(1, math.ceil((h * w) / MAX_PIXELS)))
+                pieces.extend(split_strips(page, count))
         else:
             pieces = [page_bgr]
 

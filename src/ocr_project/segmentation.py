@@ -284,6 +284,11 @@ def split_strips(image_bgr, count, min_gap_rows=6):
     if count < 2:
         return [image_bgr]
 
+    # segment_lines() straightens the page internally and reports line
+    # positions in that straightened frame. Slicing the original with those
+    # numbers would be off by the tilt, so straighten here too and slice what
+    # was actually measured. On an already-straight page this is a no-op.
+    image_bgr, _ = deskew(image_bgr)
     crops = segment_lines(image_bgr)
     h0 = image_bgr.shape[0]
     # Midway between two consecutive line centres -- the point furthest from
