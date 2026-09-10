@@ -64,6 +64,7 @@ def main() -> int:
             e = cer(row["text"], text)
             scores.append(e)
             results.setdefault(row["image"], {})[label] = e
+            results[row["image"]]["condition"] = row.get("condition", "?")
             results[row["image"]].setdefault("text_" + label, text)
             print(f"  [{i}/{len(rows)}] {e:6.1%}", flush=True)
         reader.model = None
@@ -85,6 +86,20 @@ def main() -> int:
         print(f"{'адаптер':10s} {st.mean(tuned):9.1%} {st.median(tuned):9.1%}")
         better = sum(1 for b, t in zip(base, tuned) if t < b)
         print(f"лучше с адаптером на {better} из {len(base)} страниц")
+
+        # The point of this dataset is that the same text appears scanned, in
+        # good light and in poor light. A model that only improves on scans has
+        # not learned to read a photograph, which is what the app receives.
+        print(f"
+{'условие съёмки':16s} {'база':>9s} {'адаптер':>9s} {'разница':>9s}")
+        for cond in sorted({r.get("condition", "?") for r in results.values()}):
+            b_ = [r["база"] for r in results.values()
+                  if r.get("condition") == cond and "база" in r]
+            t_ = [r["адаптер"] for r in results.values()
+                  if r.get("condition") == cond and "адаптер" in r]
+            if b_ and t_:
+                print(f"{cond:16s} {st.mean(b_):9.1%} {st.mean(t_):9.1%} "
+                      f"{st.mean(b_) - st.mean(t_):+9.1%}")
     return 0
 
 

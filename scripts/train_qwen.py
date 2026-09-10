@@ -122,7 +122,14 @@ def main() -> int:
     random.Random(0).shuffle(writers)
     held = set(writers[: max(1, len(writers) // 10)])
     train = [r for r in rows if r["writer"] not in held]
-    test = [r for r in rows if r["writer"] in held][: args.holdout]
+    # The holdout takes the three lighting conditions in equal measure: the
+    # whole point is to see whether a photograph in poor light improved, and a
+    # holdout that happened to be mostly scans could not show it.
+    test = []
+    per_condition = max(1, args.holdout // 3)
+    for condition in ("Сканы", "ФотоСветлое", "ФотоТемное"):
+        test += [r for r in rows if r["writer"] in held
+                 and r.get("condition") == condition][:per_condition]
     if args.limit:
         train = train[: args.limit]
     print(f"страниц для обучения {len(train)}, для проверки {len(test)} "
