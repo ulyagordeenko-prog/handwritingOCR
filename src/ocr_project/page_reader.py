@@ -14,6 +14,8 @@ The weights are ~17 GB in full precision, so they are loaded quantized to
 """
 from __future__ import annotations
 
+import re
+
 import torch
 from PIL import Image
 
@@ -90,7 +92,7 @@ def trim_runaway(lines: list[str], max_repeats: int = 3) -> list[str]:
     """
     cleaned = []
     for line in lines:
-        cleaned.append(_trim_line(line, max_repeats))
+        cleaned.append(_trim_line(_collapse_loops(line), max_repeats))
 
     # the same collapse can span whole lines rather than sit inside one
     out: list[str] = []
@@ -102,6 +104,25 @@ def trim_runaway(lines: list[str], max_repeats: int = 3) -> list[str]:
             continue
         out.append(line)
     return out
+
+
+# Any run of eight or more characters repeated three times or more, whatever
+# separates the copies. The first version of this split on commas alone, which
+# caught "снега, снега, снега..." and missed the worse case: a whole sentence
+# repeated through periods -- "На земле листья окрасились в яркие цвета." some
+# twenty times, 2183 characters on one line against a 810-character page.
+# Three copies, not two: a page's reference transcript legitimately contains
+# "много яблок - много помидоров" twice running, because the child wrote it
+# twice.
+_LOOP = re.compile(r"(.{8,}?)\1{2,}", re.DOTALL)
+
+
+def _collapse_loops(line: str) -> str:
+    previous = None
+    while previous != line:                 # a loop can nest inside a loop
+        previous = line
+        line = _LOOP.sub(lambda m: m.group(1), line)
+    return line
 
 
 def _trim_line(line: str, max_repeats: int) -> str:
