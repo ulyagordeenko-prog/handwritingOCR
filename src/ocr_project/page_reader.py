@@ -14,12 +14,10 @@ The weights are ~17 GB in full precision, so they are loaded quantized to
 """
 from __future__ import annotations
 
-import math
-
 import torch
 from PIL import Image
 
-from .segmentation import crop_to_page, deskew, split_pages, split_strips
+from .segmentation import crop_to_page, deskew, split_pages
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -55,18 +53,6 @@ PROMPT = (
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
 
-# Qwen3-VL turns a picture into visual tokens of 32x32 pixels and caps how many
-# it will make. Anything above the cap is downscaled before the model ever looks
-# at it -- our 1935x1960 test photo loses two thirds of its area that way, and
-# no amount of sharpening survives that. Reading the page in horizontal strips
-# keeps each piece under the cap, so the model sees the original pixels.
-MAX_VISUAL_TOKENS = 1280
-PIXELS_PER_TOKEN = 32 * 32
-MAX_PIXELS = MAX_VISUAL_TOKENS * PIXELS_PER_TOKEN
-# A tall photo needs more pieces than a square one. Three was too few: a
-# 6000x2000 shot still came out downscaled 3.3x, which defeats the purpose.
-MAX_STRIPS = 6
-
 
 def enough_vram() -> bool:
     """Can this machine realistically run Qwen at all?
@@ -92,8 +78,7 @@ def trim_runaway(lines: list[str], max_repeats: int = 3) -> list[str]:
     Greedy decoding sometimes falls into a rut and emits one fragment until it
     runs out of budget -- measured on a real page: "снега, снега, снега..."
     several hundred times, turning a 1349-character page into 2364 characters
-    of output and a character error above 100%. It happens on strips more than
-    on whole pages, but it happens on both, and those runaways dominate the
+    of output and a character error above 100%. Those runaways dominate the
     average error: excluding them drops whole-page error from 38.9% to 24.9%.
 
     Blanket repetition bans are not an option. The reference transcript of that
@@ -169,35 +154,24 @@ class PageReader:
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
-    def read_page(self, page_bgr, max_new_tokens: int = 1024, strips: bool = False,
-                  progress=None) -> list[str]:
+    def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None) -> list[str]:
         """Read a photographed page.
 
-        Cropping to the sheet, straightening, and separating a two-page spread
-        always happen: an open notebook photographed as a spread otherwise
-        reaches the model as two interleaved columns, and separating them was
-        worth 54% -> 12% character error on one measured page.
+        The photo is cropped to the sheet, straightened, and separated into
+        two pages if it is a spread -- an open notebook otherwise reaches the
+        model as two interleaved columns, and separating them was worth 54% ->
+        12% character error on one measured page.
 
-        Cutting each page into horizontal strips is off by default. It was
-        built to stop the model downscaling a 3.8-megapixel photo into its
-        1.3-megapixel token budget, and it does that -- but measured over six
-        pages it changed nothing that matters: 16.1% mean character error
-        against 15.9% for whole pages, with the medians favouring strips by as
-        little as the means favour whole. A tie is not a reason to add three
-        generations per page, so the plain path is the default and this stays
-        as a switch.
+        Cutting each page into horizontal strips was built and then removed.
+        It does what it claimed -- a 3.8-megapixel photo no longer gets
+        downscaled into the model's 1.3-megapixel token budget -- but over six
+        measured pages that bought nothing: 16.1% character error against
+        15.9% for plain whole pages. It cost three generations per page and
+        four bugs, so it is gone rather than left as an unused switch.
         """
         page_bgr, _ = crop_to_page(page_bgr)
         page_bgr, _ = deskew(page_bgr)
-
-        pieces = []
-        for page in split_pages(page_bgr):
-            if not strips:
-                pieces.append(page)
-                continue
-            h, w = page.shape[:2]
-            count = min(MAX_STRIPS, max(1, math.ceil((h * w) / MAX_PIXELS)))
-            pieces.extend(split_strips(page, count))
+        pieces = split_pages(page_bgr)
 
         lines: list[str] = []
         for i, piece in enumerate(pieces):
@@ -229,7 +203,7 @@ class PageReader:
         )[0].strip()
         return trim_runaway([line for line in text.splitlines() if line.strip()])
 
-    def read_file(self, path: str, strips: bool = False, progress=None) -> list[str]:
+    def read_file(self, path: str, progress=None) -> list[str]:
         import cv2
         import numpy as np
 
@@ -237,4 +211,4 @@ class PageReader:
         image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"не удалось прочитать изображение: {path}")
-        return self.read_page(image, strips=strips, progress=progress)
+        return self.read_page(image, progress=progress)
