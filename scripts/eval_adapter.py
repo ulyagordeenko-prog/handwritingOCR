@@ -90,8 +90,7 @@ def main() -> int:
         # The point of this dataset is that the same text appears scanned, in
         # good light and in poor light. A model that only improves on scans has
         # not learned to read a photograph, which is what the app receives.
-        print(f"
-{'условие съёмки':16s} {'база':>9s} {'адаптер':>9s} {'разница':>9s}")
+        print(f"\n{'условие съёмки':16s} {'база':>9s} {'адаптер':>9s} {'разница':>9s}")
         for cond in sorted({r.get("condition", "?") for r in results.values()}):
             b_ = [r["база"] for r in results.values()
                   if r.get("condition") == cond and "база" in r]
