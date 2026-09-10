@@ -175,6 +175,11 @@ def split_pages(image_bgr, center_frac=0.28, min_gutter_frac=0.28):
     return [left, right]
 
 
+def pad_rows(small, frac=0.004):
+    """A few rows of breathing room, scaled to the page."""
+    return max(2, int(small.shape[0] * frac))
+
+
 def segment_lines(image_bgr, target_width=1400, margin_frac=0.1, pad_frac=0.006):
     """
     Find text-line bands in a single-column page photo. Deskews first so a
@@ -231,10 +236,20 @@ def segment_lines(image_bgr, target_width=1400, margin_frac=0.1, pad_frac=0.006)
     else:
         avg_gap = int(small.shape[0] * 0.05)
 
-    bounds = [max(0, peaks[0] - avg_gap // 2)]
+    # The first and last line have no neighbour on one side, so half the average
+    # gap is a guess where every other boundary is a measurement -- and it is the
+    # guess that was cutting ascenders off the top line and descenders off the
+    # bottom one, leaving 1.7% of a page's ink outside every detected line.
+    # Extend those two outward to wherever the ink actually stops.
+    ink_rows = np.where(row_sums > row_sums.max() * 0.05)[0]
+    first_ink = int(ink_rows[0]) if len(ink_rows) else 0
+    last_ink = int(ink_rows[-1]) if len(ink_rows) else small.shape[0]
+
+    bounds = [max(0, min(peaks[0] - avg_gap // 2, first_ink - pad_rows(small)))]
     for a, b in zip(peaks[:-1], peaks[1:]):
         bounds.append((a + b) // 2)
-    bounds.append(min(small.shape[0], peaks[-1] + avg_gap // 2))
+    bounds.append(min(small.shape[0], max(peaks[-1] + avg_gap // 2,
+                                          last_ink + pad_rows(small))))
 
     pad = max(2, int(small.shape[0] * pad_frac))
     crops = []
