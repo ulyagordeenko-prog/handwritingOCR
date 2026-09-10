@@ -36,3 +36,7 @@ checkpoints/*
 !checkpoints/trocr-lora-v5/
 graphify-out/
 bench/
+
+# обучение и подготовка данных нужны на арендованной машине — держим в репозитории
+!scripts/train_qwen.py
+!scripts/hwr200_pages.py
