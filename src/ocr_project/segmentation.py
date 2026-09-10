@@ -116,8 +116,13 @@ def split_pages(image_bgr, center_frac=0.28, min_gutter_frac=0.28):
     col_density = gaussian_filter1d(col_density, sigma=4)
 
     w = col_density.shape[0]
-    lo = int(w * (0.5 - center_frac))
-    hi = int(w * (0.5 + center_frac))
+    # A frame shaped like a spread has its spine near the middle, so the search
+    # narrows. Left wide, the darkest column on two of eight measured spreads
+    # was at the very edge of the window -- a shadowed outer margin, not the
+    # spine -- which put the cut at 78% of the width and was then thrown out.
+    frac = 0.12 if (w0 / max(1, h0) > 1.3 and w0 * h0 >= 2_000_000) else center_frac
+    lo = int(w * (0.5 - frac))
+    hi = int(w * (0.5 + frac))
     if hi <= lo:
         return [image_bgr]
 
@@ -129,7 +134,26 @@ def split_pages(image_bgr, center_frac=0.28, min_gutter_frac=0.28):
     # A real spine gap has noticeably less ink than the page body around
     # it; a single page's center (which may run straight through a
     # sentence) usually doesn't dip nearly this far.
-    if typical_density <= 1e-6 or gutter_density > typical_density * (1 - min_gutter_frac):
+    #
+    # But shape decides before ink does. Measured across eight notebook
+    # spreads, the gutter dip ranged from 0.57 to 0.87 of the page's typical
+    # density, and no single threshold separated them: four spreads split and
+    # four did not, so the line finder ran a row projection across two
+    # independently flowing columns and returned 18 bands where the page had
+    # 42 lines. Aspect ratio has no such overlap. A sheet of paper is taller
+    # than it is wide; a photograph twice as wide as it is tall is two sheets,
+    # whatever the ink between them happens to do.
+    # Shape alone is not enough: a cropped photo of a single stamp measured
+    # 680x429, wide by this test, and got cut through the middle of the text.
+    # Ink depth does not separate the two either -- the spreads' gutter dip
+    # ranged 0.00-1.71 of typical density and the stamp sat at 1.08, inside
+    # that range. Size does, with no overlap at all: the spreads are 7.7-12
+    # megapixels, the stamp crops 0.2-0.3. A two-page spread worth reading is
+    # necessarily photographed large; a small landscape image is a crop of one
+    # thing, not two pages.
+    wide = w0 / max(1, h0) > 1.3 and w0 * h0 >= 2_000_000
+    if not wide and (typical_density <= 1e-6
+                     or gutter_density > typical_density * (1 - min_gutter_frac)):
         return [image_bgr]
 
     split_x = int(gutter_col / scale)
@@ -139,6 +163,13 @@ def split_pages(image_bgr, center_frac=0.28, min_gutter_frac=0.28):
     # mistaken for a gutter) -- a real spread splits roughly down the middle.
     ratio = left.shape[1] / max(1, right.shape[1])
     if not (0.5 < ratio < 2.0):
+        return [image_bgr]
+    # Each half must itself look like a page rather than a wide band, which is
+    # what keeps a genuinely landscape single page from being cut in two. The
+    # bound is the same 1.3 used to call the frame a spread in the first place:
+    # a tighter 1.1 rejected three spreads whose spine sits off-centre, one of
+    # which had been splitting correctly before.
+    if wide and max(left.shape[1], right.shape[1]) / h0 > 1.3:
         return [image_bgr]
 
     return [left, right]
