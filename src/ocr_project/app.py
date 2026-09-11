@@ -41,11 +41,33 @@ def confidence_color(confidence: float) -> str:
     return COLOR_OK
 
 
+# One size for the window, fixed: the layout is designed for it rather than
+# stretched to whatever the screen offers. Logical pixels -- multiplied by the
+# screen's scale factor below, so the window looks the same on a 100% monitor
+# and a 150% laptop.
+WINDOW_W, WINDOW_H = 1280, 760
+
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 8.0, 1.25
+
+
+def _enable_crisp_text():
+    """Tell Windows the app handles display scaling itself. Without this a
+    laptop at 125-150% scaling stretches the whole window as a bitmap and
+    every letter comes out blurred."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass    # not Windows, or too old a Windows -- blurry is still usable
+
+
 class HandwritingApp(tk.Tk):
     def __init__(self):
+        _enable_crisp_text()
         super().__init__()
         self.title("Распознавание рукописного текста")
-        self.geometry("1150x800")
+        self._place_window()
+        self.resizable(False, False)
 
         self.recognizer: Recognizer | None = None
         self.page_reader: page_reader.PageReader | None = None
@@ -60,6 +82,18 @@ class HandwritingApp(tk.Tk):
         self.status.set("Загрузка модели…")
         threading.Thread(target=self._load_model, daemon=True).start()
         self.after(50, self._drain_events)
+
+    def _place_window(self):
+        scale = self.winfo_fpixels("1i") / 96.0          # 1.0 at 100%, 1.5 at 150%
+        w, h = int(WINDOW_W * scale), int(WINDOW_H * scale)
+        # A fixed size must still never be larger than the screen it opens on,
+        # or the bottom of the window lands under the taskbar with no way to
+        # reach it -- the window cannot be resized to recover.
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = min(w, sw - int(20 * scale))
+        h = min(h, sh - int(90 * scale))
+        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 2 - int(20 * scale))
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _drain_events(self):
         try:
@@ -127,13 +161,30 @@ class HandwritingApp(tk.Tk):
         # works internally, not how anyone wants to proofread a page.
         panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        # Photo and text start exactly half and half. Left to itself the split
+        # follows each widget's natural width, which put the photo at 575 and
+        # the text at 680 -- uneven in a window whose size is designed. Set on
+        # the first real layout: scheduled any earlier, the pane is still 1 px
+        # wide and the position is thrown away.
+        def split_evenly(event):
+            if event.width > 100:
+                panes.sashpos(0, event.width // 2)
+                panes.unbind("<Configure>", bound)
+        bound = panes.bind("<Configure>", split_evenly, add="+")
 
         left = ttk.Frame(panes)
-        self.canvas = tk.Canvas(left, background="#f5f5f5", highlightthickness=0)
-        canvas_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=canvas_scroll.set)
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        canvas_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._build_zoom_bar(left)
+        view = ttk.Frame(left)
+        view.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(view, background="#f5f5f5", highlightthickness=0)
+        yscroll = ttk.Scrollbar(view, orient=tk.VERTICAL, command=self.canvas.yview)
+        xscroll = ttk.Scrollbar(view, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        view.rowconfigure(0, weight=1)
+        view.columnconfigure(0, weight=1)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
         panes.add(left, weight=1)
 
         right = ttk.Frame(panes)
@@ -151,7 +202,86 @@ class HandwritingApp(tk.Tk):
         self.text.tag_configure("medium", background=COLOR_MEDIUM)
 
         self._page_photo = None
+        self._zoom = ZOOM_MIN            # 1.0 = the whole page fits the panel
+        self._offset = (0, 0)
+        self._shown = (1, 1)
         self.canvas.bind("<Configure>", lambda e: self._redraw_page())
+
+        # Ctrl + wheel zooms around the cursor; the plain wheel scrolls, and
+        # shift + wheel scrolls sideways -- the conventions of image viewers.
+        self.canvas.bind("<Control-MouseWheel>", self._on_wheel_zoom)
+        self.canvas.bind("<MouseWheel>",
+                         lambda e: self.canvas.yview_scroll(-e.delta // 120, "units"))
+        self.canvas.bind("<Shift-MouseWheel>",
+                         lambda e: self.canvas.xview_scroll(-e.delta // 120, "units"))
+        # drag to move around an enlarged page
+        self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
+        self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+        for key in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
+            self.bind(key, lambda e: self._zoom_by(ZOOM_STEP))
+        for key in ("<Control-minus>", "<Control-KP_Subtract>"):
+            self.bind(key, lambda e: self._zoom_by(1 / ZOOM_STEP))
+        self.bind("<Control-0>", lambda e: self._set_zoom(ZOOM_MIN))
+        self._update_zoom_controls()      # no page yet: zoom starts disabled
+
+    def _build_zoom_bar(self, parent):
+        bar = ttk.Frame(parent, padding=(0, 6, 0, 0))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.zoom_out_btn = ttk.Button(bar, text="−", width=3,
+                                       command=lambda: self._zoom_by(1 / ZOOM_STEP))
+        self.zoom_out_btn.pack(side=tk.LEFT)
+        self.zoom_label = ttk.Label(bar, text="100%", width=6, anchor="center")
+        self.zoom_label.pack(side=tk.LEFT, padx=4)
+        self.zoom_in_btn = ttk.Button(bar, text="+", width=3,
+                                      command=lambda: self._zoom_by(ZOOM_STEP))
+        self.zoom_in_btn.pack(side=tk.LEFT)
+        self.zoom_fit_btn = ttk.Button(bar, text="По размеру окна",
+                                       command=lambda: self._set_zoom(ZOOM_MIN))
+        self.zoom_fit_btn.pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(bar, text="Ctrl + колесо мыши — увеличить, перетаскивание — сдвинуть",
+                  foreground="#777").pack(side=tk.RIGHT)
+
+    def _update_zoom_controls(self):
+        self.zoom_label.configure(text=f"{self._zoom * 100:.0f}%")
+        has_page = getattr(self, "_page_image", None) is not None
+        on, off = ["!disabled"], ["disabled"]
+        self.zoom_out_btn.state(on if has_page and self._zoom > ZOOM_MIN else off)
+        self.zoom_in_btn.state(on if has_page and self._zoom < ZOOM_MAX else off)
+        self.zoom_fit_btn.state(on if has_page and self._zoom != ZOOM_MIN else off)
+        self.canvas.configure(cursor="fleur" if self._zoom > ZOOM_MIN else "")
+
+    def _zoom_by(self, factor, anchor=None):
+        self._set_zoom(self._zoom * factor, anchor)
+
+    def _set_zoom(self, zoom, anchor=None):
+        """Change magnification, keeping the point under `anchor` (canvas
+        window coordinates) where it was -- the centre of the view if none."""
+        if getattr(self, "_page_image", None) is None:
+            return
+        zoom = min(ZOOM_MAX, max(ZOOM_MIN, zoom))
+        if abs(zoom - self._zoom) < 1e-6:
+            return
+        if anchor is None:
+            anchor = (self.canvas.winfo_width() / 2, self.canvas.winfo_height() / 2)
+        ax, ay = anchor
+        # where the anchor sits on the page, as a fraction of the shown image
+        ox, oy = self._offset
+        sw, sh = self._shown
+        fx = (self.canvas.canvasx(ax) - ox) / max(1, sw)
+        fy = (self.canvas.canvasy(ay) - oy) / max(1, sh)
+
+        self._zoom = zoom
+        self._redraw_page()
+
+        ox, oy = self._offset
+        sw, sh = self._shown
+        total_w = max(self.canvas.winfo_width(), sw)
+        total_h = max(self.canvas.winfo_height(), sh)
+        self.canvas.xview_moveto(max(0.0, (ox + fx * sw - ax) / total_w))
+        self.canvas.yview_moveto(max(0.0, (oy + fy * sh - ay) / total_h))
+
+    def _on_wheel_zoom(self, event):
+        self._zoom_by(ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP, (event.x, event.y))
 
     def _load_model(self):
         try:
@@ -189,6 +319,9 @@ class HandwritingApp(tk.Tk):
         self.text.delete("1.0", tk.END)
         data = np.fromfile(path, dtype=np.uint8)
         self._page_image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        self._zoom = ZOOM_MIN
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
         self._redraw_page()
 
         self.status.set(
@@ -291,24 +424,32 @@ class HandwritingApp(tk.Tk):
         self.copy_btn.configure(state=tk.NORMAL)
 
     def _redraw_page(self):
-        """Fit the page into the left pane, keeping its proportions."""
+        """Show the page at the current magnification. At 100% it fits the
+        panel and sits centred; above that it overflows and scrolls."""
         image = getattr(self, "_page_image", None)
         if image is None:
             return
         avail_w = max(self.canvas.winfo_width(), 1)
         avail_h = max(self.canvas.winfo_height(), 1)
         h, w = image.shape[:2]
-        scale = min(avail_w / w, avail_h / h)
+        scale = min(avail_w / w, avail_h / h) * self._zoom
         if scale <= 0:
             return
-        pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        pil = pil.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+        new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+        # cv2 rather than PIL's Lanczos: this runs on every zoom step, and a
+        # 12-megapixel photo enlarged 8x has to redraw without a visible stall
+        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        rgb = cv2.cvtColor(cv2.resize(image, (new_w, new_h), interpolation=interp),
+                           cv2.COLOR_BGR2RGB)
 
         # keep a reference or tkinter garbage-collects the image away
-        self._page_photo = ImageTk.PhotoImage(pil)
+        self._page_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        ox, oy = max(0, (avail_w - new_w) // 2), max(0, (avail_h - new_h) // 2)
+        self._offset, self._shown = (ox, oy), (new_w, new_h)
         self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor="nw", image=self._page_photo)
-        self.canvas.configure(scrollregion=(0, 0, pil.width, pil.height))
+        self.canvas.create_image(ox, oy, anchor="nw", image=self._page_photo)
+        self.canvas.configure(scrollregion=(0, 0, max(avail_w, new_w), max(avail_h, new_h)))
+        self._update_zoom_controls()
 
     def _current_text(self) -> str:
         return self.text.get("1.0", tk.END).strip()
