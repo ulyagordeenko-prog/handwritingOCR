@@ -25,7 +25,7 @@ eval_data/
 eval_lines/
 
 # Research tooling and raw experiment output -- the repo is the app
-scripts/
+scripts/*
 server_results/
 deepseek_out/
 *.log
@@ -40,6 +40,7 @@ bench/
 # обучение и подготовка данных нужны на арендованной машине — держим в репозитории
 !scripts/train_qwen.py
 !scripts/hwr200_pages.py
+!scripts/build_ui_assets.py
 
 # данные обучения и скачанные с сервера адаптеры — не часть приложения
 hwr200_pages.jsonl

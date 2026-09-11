@@ -5,49 +5,41 @@ The page sits on the left and its transcription on the right, the way a
 person proofreads. Two engines feed it: the line recognizer, which cuts the
 page into lines and tints each by how sure it was, and Qwen3-VL, which
 reads the whole photo in one pass -- more accurate, but it needs a card
-with about 8 GB. Text is editable, so fixing a mistake and exporting a
-clean transcript is one flow.
+with about 8 GB, so the app uses it only where one is present. Text is
+editable, so fixing a mistake and exporting a clean transcript is one flow.
+
+The window is the Figma design in design/main.svg: its frosted background,
+glass panels, button faces and legend are pre-rendered images (see skin.py),
+and the live parts -- photo, text, status, zoom, scroll thumbs -- are laid
+over them at the design's own coordinates.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import queue
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import page_reader
+from . import page_reader, skin
 from .recognizer import RecognizedLine, Recognizer
 
 # Confidence below this is treated as "look at this one".
 LOW_CONFIDENCE = 0.80
 MEDIUM_CONFIDENCE = 0.90
 
-COLOR_LOW = "#ffd9d9"
-COLOR_MEDIUM = "#fff3cd"
-COLOR_OK = "#ffffff"
-
-
-
-def confidence_color(confidence: float) -> str:
-    if confidence < LOW_CONFIDENCE:
-        return COLOR_LOW
-    if confidence < MEDIUM_CONFIDENCE:
-        return COLOR_MEDIUM
-    return COLOR_OK
-
-
-# One size for the window, fixed: the layout is designed for it rather than
-# stretched to whatever the screen offers. Logical pixels -- multiplied by the
-# screen's scale factor below, so the window looks the same on a 100% monitor
-# and a 150% laptop.
-WINDOW_W, WINDOW_H = 1280, 760
-
 ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 8.0, 1.25
+
+# Painted where the window should be see-through -- outside its rounded
+# corners. Magenta, because the design is greys and a key colour that turned
+# up inside the window would punch a hole in it.
+KEY = (255, 0, 255)
 
 
 def _enable_crisp_text():
@@ -55,161 +47,289 @@ def _enable_crisp_text():
     laptop at 125-150% scaling stretches the whole window as a bitmap and
     every letter comes out blurred."""
     try:
-        import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass    # not Windows, or too old a Windows -- blurry is still usable
+
+
+class SkinButton:
+    """A button that is a region of the pre-rendered design. The face in the
+    background image is the button; this lays hover, pressed and disabled
+    versions of that same face over it."""
+
+    def __init__(self, app, rect, command, shape="round", radius=skin.BUTTON_RADIUS):
+        self.app, self.command = app, command
+        box = skin.scaled(rect, app.s)
+        crop = app._bg_pil.crop(box)
+        faces = skin.button_states(crop, shape, radius * app.s)
+        self.faces = {k: ImageTk.PhotoImage(v.convert("RGB")) for k, v in faces.items()}
+        self.item = app.ui.create_image(box[0], box[1], anchor="nw", image=self.faces["normal"])
+        self.enabled, self.hover, self.pressed = True, False, False
+        ui = app.ui
+        ui.tag_bind(self.item, "<Enter>", self._enter)
+        ui.tag_bind(self.item, "<Leave>", self._leave)
+        ui.tag_bind(self.item, "<ButtonPress-1>", self._press)
+        ui.tag_bind(self.item, "<ButtonRelease-1>", self._release)
+
+    def set_enabled(self, on: bool):
+        self.enabled = bool(on)
+        self._refresh()
+
+    def _refresh(self):
+        if not self.enabled:
+            face = "disabled"
+        elif self.pressed and self.hover:
+            face = "pressed"
+        elif self.hover:
+            face = "hover"
+        else:
+            face = "normal"
+        self.app.ui.itemconfigure(self.item, image=self.faces[face])
+        self.app.ui.configure(cursor="hand2" if self.hover and self.enabled else "")
+
+    def _enter(self, _):
+        self.hover = True
+        self._refresh()
+
+    def _leave(self, _):
+        self.hover = self.pressed = False
+        self._refresh()
+
+    def _press(self, _):
+        self.pressed = True
+        self._refresh()
+
+    def _release(self, _):
+        fire = self.pressed and self.hover and self.enabled
+        self.pressed = False
+        self._refresh()
+        if fire:
+            self.command()
+
+
+class ThinScrollbar:
+    """The design's scrollbar: a slim rounded thumb on a track that is part of
+    the background image, with the arrow circles at either end clickable.
+    Speaks the same set()/command protocol as a ttk.Scrollbar."""
+
+    def __init__(self, app, orient, spec, command, base=None):
+        self.app, self.orient, self.command = app, orient, command
+        self.base = base            # flat colour under the thumb, if not glass
+        self.track = skin.scaled(spec["track"], app.s)
+        self.item, self._image, self._span = None, None, (0.0, 1.0)
+        self._grab = None
+        for key, step in (("back", -1), ("fwd", 1)):
+            if key in spec:
+                SkinButton(app, spec[key], lambda n=step: command("scroll", n, "units"),
+                           shape="circle")
+
+    def _extent(self):
+        l, t, r, b = self.track
+        return (l, r) if self.orient == "horizontal" else (t, b)
+
+    def set(self, first, last):
+        first, last = float(first), float(last)
+        self._span = (first, last)
+        ui = self.app.ui
+        if last - first >= 0.999:          # nothing to scroll: no thumb
+            if self.item is not None:
+                ui.itemconfigure(self.item, state="hidden")
+            return
+        start, end = self._extent()
+        length = end - start
+        size = max(round(24 * self.app.s), round(length * (last - first)))
+        pos = start + round((length - size) * first / max(1e-6, 1 - (last - first)))
+        l, t, r, b = self.track
+        box = (pos, t, pos + size, b) if self.orient == "horizontal" else (l, pos, r, pos + size)
+        thickness = (b - t) if self.orient == "horizontal" else (r - l)
+        self._image = ImageTk.PhotoImage(
+            skin.thumb_image(self.app._bg_pil, box, thickness / 2, self.base).convert("RGB"))
+        if self.item is None:
+            self.item = ui.create_image(box[0], box[1], anchor="nw", image=self._image)
+            ui.tag_bind(self.item, "<ButtonPress-1>", self._press)
+            ui.tag_bind(self.item, "<B1-Motion>", self._drag)
+        else:
+            ui.coords(self.item, box[0], box[1])
+            ui.itemconfigure(self.item, image=self._image, state="normal")
+        self._thumb = (box[0], box[2]) if self.orient == "horizontal" else (box[1], box[3])
+
+    def _coord(self, event):
+        return event.x if self.orient == "horizontal" else event.y
+
+    def _press(self, event):
+        self._grab = self._coord(event) - self._thumb[0]
+
+    def _drag(self, event):
+        start, end = self._extent()
+        size = self._thumb[1] - self._thumb[0]
+        first, last = self._span
+        travel = max(1, (end - start) - size)
+        frac = (self._coord(event) - self._grab - start) / travel
+        frac = min(1.0, max(0.0, frac)) * (1 - (last - first))
+        self.command("moveto", frac)
 
 
 class HandwritingApp(tk.Tk):
     def __init__(self):
         _enable_crisp_text()
         super().__init__()
-        self.title("Распознавание рукописного текста")
-        self._place_window()
-        self.resizable(False, False)
+        self.title("Handwriter")
+        self._setup_window()
 
         self.recognizer: Recognizer | None = None
         self.page_reader: page_reader.PageReader | None = None
+        # Whole-page reading where the card can take it, lines everywhere else.
+        # The design has no switch for this, and the only sensible choice is
+        # the hardware's anyway.
+        self.whole_page = page_reader.enough_vram()
+        self._page_image = None
+        self._page_name = ""
+        self._busy = False
 
         # Worker threads must not touch tkinter (not even via .after());
         # they post messages here and the main thread drains the queue.
         self._events: queue.Queue[tuple] = queue.Queue()
 
-        self._build_toolbar()
-        self._build_body()
-
+        self._build_ui()
         self.status.set("Загрузка модели…")
         threading.Thread(target=self._load_model, daemon=True).start()
         self.after(50, self._drain_events)
 
-    def _place_window(self):
-        scale = self.winfo_fpixels("1i") / 96.0          # 1.0 at 100%, 1.5 at 150%
-        w, h = int(WINDOW_W * scale), int(WINDOW_H * scale)
-        # A fixed size must still never be larger than the screen it opens on,
-        # or the bottom of the window lands under the taskbar with no way to
-        # reach it -- the window cannot be resized to recover.
+    # -- window ---------------------------------------------------------------
+
+    def _setup_window(self):
+        dpi = self.winfo_fpixels("1i") / 96.0          # 1.0 at 100%, 1.5 at 150%
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w = min(w, sw - int(20 * scale))
-        h = min(h, sh - int(90 * scale))
-        x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 2 - int(20 * scale))
-        self.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _drain_events(self):
+        self.s = skin.pick_scale(dpi, sw, sh, margin_w=round(20 * dpi), margin_h=round(80 * dpi))
+        self.W, self.H = round(skin.WIDTH * self.s), round(skin.HEIGHT * self.s)
+        x = max(0, (sw - self.W) // 2)
+        y = max(0, (sh - self.H) // 2 - round(20 * dpi))
+        self.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        self.resizable(False, False)
+        # The design draws its own title bar, so Windows' is removed.
+        self.overrideredirect(True)
+        self.configure(bg=skin.hex_color(KEY))
         try:
-            while True:
-                kind, payload = self._events.get_nowait()
-                if kind == "model_ready":
-                    self._model_ready(payload)
-                elif kind == "model_failed":
-                    self._model_failed(payload)
-                elif kind == "recognized":
-                    self._show_results(*payload)
-                elif kind == "recognize_failed":
-                    self._recognize_failed(payload)
-                elif kind == "status":
-                    self.status.set(payload)
-                elif kind == "progress":
-                    self._update_progress(*payload)
-        except queue.Empty:
+            self.attributes("-transparentcolor", skin.hex_color(KEY))
+        except tk.TclError:
             pass
-        self.after(50, self._drain_events)
+        self.after(10, self._show_in_taskbar)
 
-    def _build_toolbar(self):
-        bar = ttk.Frame(self, padding=(10, 8))
-        bar.pack(fill=tk.X)
+    def _hwnd(self):
+        return ctypes.windll.user32.GetParent(self.winfo_id())
 
-        self.open_btn = ttk.Button(bar, text="Открыть фото", command=self.on_open, state=tk.DISABLED)
-        self.open_btn.pack(side=tk.LEFT)
+    def _show_in_taskbar(self, attempts: int = 40):
+        """A window without Windows' title bar also loses its taskbar button
+        and its place in Alt+Tab. Marking it an app window brings both back.
 
-        self.save_btn = ttk.Button(bar, text="Сохранить текст", command=self.on_save, state=tk.DISABLED)
-        self.save_btn.pack(side=tk.LEFT, padx=(8, 0))
+        It has to wait for the window to exist. Scheduled straight after
+        construction, this ran before Tk had created the real window -- the
+        layout build in between is heavy -- so the handle it got was 0 and the
+        style change went nowhere, silently. It now retries until there is a
+        handle, and checks that the change took."""
+        GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x00040000, 0x00000080
+        try:
+            self.update_idletasks()
+            user32 = ctypes.windll.user32
+            hwnd = self._hwnd()
+            if not hwnd:
+                if attempts:
+                    self.after(50, self._show_in_taskbar, attempts - 1)
+                return
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
+            self.withdraw()
+            self.after(10, self._reappear)
+        except Exception:
+            pass    # not Windows: no taskbar button to restore
 
-        self.copy_btn = ttk.Button(bar, text="Копировать всё", command=self.on_copy, state=tk.DISABLED)
-        self.copy_btn.pack(side=tk.LEFT, padx=(8, 0))
+    def _reappear(self):
+        self.deiconify()
+        self.focus_force()
 
-        # Whole-page mode reads the photo in one go and is more accurate,
-        # but needs a card with ~8 GB; the line mode runs anywhere.
-        self.whole_page = tk.BooleanVar(value=page_reader.enough_vram())
-        self.mode_check = ttk.Checkbutton(
-            bar, text="читать страницу целиком (точнее)", variable=self.whole_page
-        )
-        self.mode_check.pack(side=tk.LEFT, padx=(16, 0))
-        if not page_reader.enough_vram():
-            self.mode_check.state(["disabled"])
+    def _minimize(self):
+        # Tk refuses to iconify a window without a title bar; Windows will.
+        try:
+            ctypes.windll.user32.ShowWindow(self._hwnd(), 6)      # SW_MINIMIZE
+        except Exception:
+            self.overrideredirect(False)
+            self.iconify()
 
+    def _drag_start(self, event):
+        if event.y > skin.TITLE_BAR[3] * self.s:
+            self._drag = None
+            return
+        self._drag = (event.x_root - self.winfo_x(), event.y_root - self.winfo_y())
+
+    def _drag_move(self, event):
+        if getattr(self, "_drag", None):
+            self.geometry(f"+{event.x_root - self._drag[0]}+{event.y_root - self._drag[1]}")
+
+    # -- layout ---------------------------------------------------------------
+
+    def _build_ui(self):
+        s = self.s
+        self._bg_pil = skin.load_background(s)
+        self.ui = tk.Canvas(self, width=self.W, height=self.H, highlightthickness=0,
+                            bd=0, bg=skin.hex_color(KEY))
+        self.ui.place(x=0, y=0)
+        self._bg_photo = ImageTk.PhotoImage(skin.window_shape(self._bg_pil, KEY))
+        bg = self.ui.create_image(0, 0, anchor="nw", image=self._bg_photo)
+        self.ui.tag_bind(bg, "<ButtonPress-1>", self._drag_start)
+        self.ui.tag_bind(bg, "<B1-Motion>", self._drag_move)
+
+        # status, where the design's note in the title bar was
         self.status = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.status).pack(side=tk.LEFT, padx=(16, 0))
+        self._status_font = tkfont.Font(family="Segoe UI", size=-round(16 * s))
+        cx, cy = skin.STATUS_CENTER
+        self._status_item = self.ui.create_text(cx * s, cy * s, text="", anchor="center",
+                                                fill=skin.STATUS_COLOR, font=self._status_font)
+        self.ui.tag_bind(self._status_item, "<ButtonPress-1>", self._drag_start)
+        self.ui.tag_bind(self._status_item, "<B1-Motion>", self._drag_move)
+        self.status.trace_add("write", lambda *_: self._render_status())
 
-        # A page takes roughly two minutes; without this the window just
-        # sits there looking hung.
-        self.progress = ttk.Progressbar(bar, mode="determinate", length=160)
-        self.progress.pack(side=tk.LEFT, padx=(16, 0))
-        self.progress.stop()
-        self.progress.pack_forget()
+        SkinButton(self, skin.MINIMIZE_HIT, self._minimize, radius=8)
+        SkinButton(self, skin.CLOSE_HIT, self.destroy, radius=8)
 
-        legend = ttk.Frame(bar)
-        legend.pack(side=tk.RIGHT)
-        ttk.Label(legend, text="уверенность:").pack(side=tk.LEFT, padx=(0, 6))
-        for color, text in ((COLOR_LOW, "низкая"), (COLOR_MEDIUM, "средняя"), (COLOR_OK, "высокая")):
-            swatch = tk.Label(legend, text=f" {text} ", bg=color, relief=tk.SOLID, borderwidth=1)
-            swatch.pack(side=tk.LEFT, padx=2)
+        self.buttons = {
+            "open": SkinButton(self, skin.BUTTONS["open"], self.on_open),
+            "save": SkinButton(self, skin.BUTTONS["save"], self.on_save),
+            "copy": SkinButton(self, skin.BUTTONS["copy"], self.on_copy),
+            "rotate": SkinButton(self, skin.BUTTONS["rotate"], self.on_rotate),
+        }
 
-    def _build_body(self):
-        # Page on the left, its transcription on the right -- the line strips
-        # this used to show one under another mirrored how the recognizer
-        # works internally, not how anyone wants to proofread a page.
-        panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        panes.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-        # Photo and text start exactly half and half. Left to itself the split
-        # follows each widget's natural width, which put the photo at 575 and
-        # the text at 680 -- uneven in a window whose size is designed. Set on
-        # the first real layout: scheduled any earlier, the pane is still 1 px
-        # wide and the position is thrown away.
-        def split_evenly(event):
-            if event.width > 100:
-                panes.sashpos(0, event.width // 2)
-                panes.unbind("<Configure>", bound)
-        bound = panes.bind("<Configure>", split_evenly, add="+")
+        self._build_photo_view()
+        self._build_text_view()
+        self._update_buttons()
 
-        left = ttk.Frame(panes)
-        self._build_zoom_bar(left)
-        view = ttk.Frame(left)
-        view.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(view, background="#f5f5f5", highlightthickness=0)
-        yscroll = ttk.Scrollbar(view, orient=tk.VERTICAL, command=self.canvas.yview)
-        xscroll = ttk.Scrollbar(view, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-        view.rowconfigure(0, weight=1)
-        view.columnconfigure(0, weight=1)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        yscroll.grid(row=0, column=1, sticky="ns")
-        xscroll.grid(row=1, column=0, sticky="ew")
-        panes.add(left, weight=1)
+    def _build_photo_view(self):
+        s = self.s
+        l, t, r, b = skin.scaled(skin.PHOTO_VIEW, s)
+        self.canvas = tk.Canvas(self.ui, width=r - l, height=b - t, highlightthickness=0, bd=0)
+        self.ui.create_window(l, t, anchor="nw", window=self.canvas)
+        # The glass the photo lies on. A canvas cannot see through to its
+        # parent, so the design's panel is drawn into it and kept pinned to
+        # the view while the page scrolls over it.
+        self._photo_glass = ImageTk.PhotoImage(self._bg_pil.crop((l, t, r, b)).convert("RGB"))
+        self._glass_item = self.canvas.create_image(0, 0, anchor="nw", image=self._photo_glass)
 
-        right = ttk.Frame(panes)
-        self.text = tk.Text(right, wrap=tk.WORD, font=("Segoe UI", 11),
-                            padx=8, pady=8, undo=True)
-        text_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.text.yview)
-        self.text.configure(yscrollcommand=text_scroll.set)
-        # Scrollbar first. pack() hands out space in packing order, and the text
-        # widget asks for 80 characters of width -- more than the 625 px its half
-        # of the fixed window has -- so packed second the scrollbar was pushed to
-        # x = 1308, outside a 1280-wide window, and simply never appeared.
-        text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        panes.add(right, weight=1)
+        self.vscroll = ThinScrollbar(self, "vertical", skin.VSCROLL, self.canvas.yview)
+        self.hscroll = ThinScrollbar(self, "horizontal", skin.HSCROLL, self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self._on_yscroll, xscrollcommand=self._on_xscroll)
 
-        # Confidence is shown by tinting whole lines in place, so the text
-        # stays one editable block you can select and copy across.
-        self.text.tag_configure("low", background=COLOR_LOW)
-        self.text.tag_configure("medium", background=COLOR_MEDIUM)
+        self.zoom_out = SkinButton(self, skin.ZOOM_OUT_HIT, lambda: self._zoom_by(1 / ZOOM_STEP),
+                                   shape="circle")
+        self.zoom_in = SkinButton(self, skin.ZOOM_IN_HIT, lambda: self._zoom_by(ZOOM_STEP),
+                                  shape="circle")
+        zx, zy = skin.ZOOM_LABEL_CENTER
+        self._zoom_item = self.ui.create_text(zx * s, zy * s, text="100 %", anchor="center",
+                                              fill=skin.TEXT_COLOR,
+                                              font=("Segoe UI", -round(10 * s)))
 
         self._page_photo = None
         self._zoom = ZOOM_MIN            # 1.0 = the whole page fits the panel
         self._offset = (0, 0)
         self._shown = (1, 1)
-        self.canvas.bind("<Configure>", lambda e: self._redraw_page())
 
         # Ctrl + wheel zooms around the cursor; the plain wheel scrolls, and
         # shift + wheel scrolls sideways -- the conventions of image viewers.
@@ -218,40 +338,84 @@ class HandwritingApp(tk.Tk):
                          lambda e: self.canvas.yview_scroll(-e.delta // 120, "units"))
         self.canvas.bind("<Shift-MouseWheel>",
                          lambda e: self.canvas.xview_scroll(-e.delta // 120, "units"))
-        # drag to move around an enlarged page
+        # drag to move around an enlarged page; double-click to fit it again
         self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
         self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
+        self.canvas.bind("<Double-Button-1>", lambda e: self._set_zoom(ZOOM_MIN))
         for key in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
             self.bind(key, lambda e: self._zoom_by(ZOOM_STEP))
         for key in ("<Control-minus>", "<Control-KP_Subtract>"):
             self.bind(key, lambda e: self._zoom_by(1 / ZOOM_STEP))
         self.bind("<Control-0>", lambda e: self._set_zoom(ZOOM_MIN))
-        self._update_zoom_controls()      # no page yet: zoom starts disabled
+        self._update_zoom_controls()
 
-    def _build_zoom_bar(self, parent):
-        bar = ttk.Frame(parent, padding=(0, 6, 0, 0))
-        bar.pack(side=tk.BOTTOM, fill=tk.X)
-        self.zoom_out_btn = ttk.Button(bar, text="−", width=3,
-                                       command=lambda: self._zoom_by(1 / ZOOM_STEP))
-        self.zoom_out_btn.pack(side=tk.LEFT)
-        self.zoom_label = ttk.Label(bar, text="100%", width=6, anchor="center")
-        self.zoom_label.pack(side=tk.LEFT, padx=4)
-        self.zoom_in_btn = ttk.Button(bar, text="+", width=3,
-                                      command=lambda: self._zoom_by(ZOOM_STEP))
-        self.zoom_in_btn.pack(side=tk.LEFT)
-        self.zoom_fit_btn = ttk.Button(bar, text="По размеру окна",
-                                       command=lambda: self._set_zoom(ZOOM_MIN))
-        self.zoom_fit_btn.pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Label(bar, text="Ctrl + колесо мыши — увеличить, перетаскивание — сдвинуть",
-                  foreground="#777").pack(side=tk.RIGHT)
+    def _build_text_view(self):
+        s = self.s
+        l, t, r, b = skin.scaled(skin.TEXT_VIEW, s)
+        base = skin.mean_color(self._bg_pil, skin.scaled(skin.TEXT_PANEL, s))
+        # A Text widget cannot show an image under its lines, so it takes the
+        # panel's average colour, and stays hidden until there is text: the
+        # empty panel is then the design's glass exactly.
+        self.text = tk.Text(self.ui, wrap=tk.WORD, font=("Georgia", -round(17 * s)),
+                            bg=skin.hex_color(base), fg=skin.TEXT_COLOR, bd=0,
+                            highlightthickness=0, padx=round(14 * s), pady=round(12 * s),
+                            undo=True, insertbackground=skin.TEXT_COLOR,
+                            selectbackground="#b9c7d8", spacing1=round(2 * s))
+        self._text_window = self.ui.create_window(l, t, anchor="nw", window=self.text,
+                                                  width=r - l, height=b - t, state="hidden")
+        # Confidence is shown by tinting whole lines in place, so the text
+        # stays one editable block you can select and copy across.
+        self.text.tag_configure("low", background=skin.tint(base, skin.LOW_TINT))
+        self.text.tag_configure("medium", background=skin.tint(base, skin.MEDIUM_TINT))
+        # The strip beside the text, where its scrollbar lives, takes the same
+        # flat colour -- left as glass it showed as a lighter band down the
+        # panel's right edge, a seam between two slightly different greys.
+        pl, pt, pr, pb = skin.scaled(skin.TEXT_PANEL, s)
+        self._text_strip = self.ui.create_rectangle(r, pt + 1, pr - 1, pb - 1, outline="",
+                                                    fill=skin.hex_color(base), state="hidden")
+        self.tscroll = ThinScrollbar(self, "vertical", {"track": skin.TEXT_SCROLL_TRACK},
+                                     self.text.yview, base=base)
+        self.text.configure(yscrollcommand=self.tscroll.set)
+
+    def _render_status(self):
+        """Fit the status into the space between the logo and the window
+        controls, cutting it with an ellipsis rather than letting it run
+        under either."""
+        text = self.status.get()
+        limit = skin.STATUS_MAX_WIDTH * self.s
+        if self._status_font.measure(text) > limit:
+            while text and self._status_font.measure(text + "…") > limit:
+                text = text[:-1]
+            text += "…"
+        self.ui.itemconfigure(self._status_item, text=text)
+
+    def _update_buttons(self):
+        ready = self.recognizer is not None and not self._busy
+        has_text = bool(self._current_text()) and not self._busy
+        self.buttons["open"].set_enabled(ready)
+        self.buttons["save"].set_enabled(has_text)
+        self.buttons["copy"].set_enabled(has_text)
+        self.buttons["rotate"].set_enabled(ready and self._page_image is not None)
+
+    # -- photo view -----------------------------------------------------------
+
+    def _on_yscroll(self, first, last):
+        self.vscroll.set(first, last)
+        self._pin_glass()
+
+    def _on_xscroll(self, first, last):
+        self.hscroll.set(first, last)
+        self._pin_glass()
+
+    def _pin_glass(self):
+        self.canvas.coords(self._glass_item, self.canvas.canvasx(0), self.canvas.canvasy(0))
+        self.canvas.tag_lower(self._glass_item)
 
     def _update_zoom_controls(self):
-        self.zoom_label.configure(text=f"{self._zoom * 100:.0f}%")
-        has_page = getattr(self, "_page_image", None) is not None
-        on, off = ["!disabled"], ["disabled"]
-        self.zoom_out_btn.state(on if has_page and self._zoom > ZOOM_MIN else off)
-        self.zoom_in_btn.state(on if has_page and self._zoom < ZOOM_MAX else off)
-        self.zoom_fit_btn.state(on if has_page and self._zoom != ZOOM_MIN else off)
+        self.ui.itemconfigure(self._zoom_item, text=f"{self._zoom * 100:.0f} %")
+        has_page = self._page_image is not None
+        self.zoom_out.set_enabled(has_page and self._zoom > ZOOM_MIN)
+        self.zoom_in.set_enabled(has_page and self._zoom < ZOOM_MAX)
         self.canvas.configure(cursor="fleur" if self._zoom > ZOOM_MIN else "")
 
     def _zoom_by(self, factor, anchor=None):
@@ -260,7 +424,7 @@ class HandwritingApp(tk.Tk):
     def _set_zoom(self, zoom, anchor=None):
         """Change magnification, keeping the point under `anchor` (canvas
         window coordinates) where it was -- the centre of the view if none."""
-        if getattr(self, "_page_image", None) is None:
+        if self._page_image is None:
             return
         zoom = min(ZOOM_MAX, max(ZOOM_MIN, zoom))
         if abs(zoom - self._zoom) < 1e-6:
@@ -287,157 +451,10 @@ class HandwritingApp(tk.Tk):
     def _on_wheel_zoom(self, event):
         self._zoom_by(ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP, (event.x, event.y))
 
-    def _load_model(self):
-        try:
-            recognizer = Recognizer()
-        except Exception as exc:  # surfacing the real reason beats a silent dead button
-            self._events.put(("model_failed", exc))
-            return
-        self._events.put(("model_ready", recognizer))
-
-    def _model_ready(self, recognizer: Recognizer):
-        self.recognizer = recognizer
-        where = "GPU" if recognizer.device == "cuda" else "CPU"
-        adapter = "дообученная модель" if recognizer.adapter_loaded else "базовая модель"
-        self.status.set(f"Готово ({adapter}, {where}). Откройте фото страницы.")
-        self.open_btn.configure(state=tk.NORMAL)
-
-        # Explain the fall back to CPU once, up front -- otherwise the only
-        # symptom is that every page takes several minutes for no visible
-        # reason.
-        if getattr(recognizer, "device_warning", None):
-            messagebox.showwarning("Видеокарта не используется", recognizer.device_warning)
-
-    def _model_failed(self, exc: Exception):
-        self.status.set("Не удалось загрузить модель")
-        messagebox.showerror("Ошибка загрузки модели", str(exc))
-
-    def on_open(self):
-        path = filedialog.askopenfilename(
-            title="Выберите фото страницы",
-            filetypes=[("Изображения", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"), ("Все файлы", "*.*")],
-        )
-        if not path:
-            return
-
-        self.text.delete("1.0", tk.END)
-        data = np.fromfile(path, dtype=np.uint8)
-        self._page_image = cv2.imdecode(data, cv2.IMREAD_COLOR)
-        self._zoom = ZOOM_MIN
-        self.canvas.xview_moveto(0)
-        self.canvas.yview_moveto(0)
-        self._redraw_page()
-
-        self.status.set(
-            "Читаю страницу целиком…" if self.whole_page.get() else "Поиск строк…"
-        )
-        self.open_btn.configure(state=tk.DISABLED)
-        self.save_btn.configure(state=tk.DISABLED)
-        self.copy_btn.configure(state=tk.DISABLED)
-        self.progress.pack(side=tk.LEFT, padx=(16, 0))
-        self.progress.configure(value=0, maximum=100)
-        # The mode is read here, on the main thread, and handed to the worker.
-        # Reading the checkbox from the worker was the one place that broke
-        # this file's own rule -- worker threads must not touch tkinter -- and
-        # it only worked because Tcl happens to marshal the call while
-        # mainloop is running. Without mainloop it raised "main thread is not
-        # in main loop" and every recognition failed.
-        whole = bool(self.whole_page.get())
-        threading.Thread(target=self._recognize, args=(path, whole), daemon=True).start()
-
-    def _recognize(self, path: str, whole: bool):
-        try:
-            if whole:
-                lines = self._read_whole_page(path)
-            else:
-                lines = self.recognizer.recognize_file(
-                    path, progress=lambda done, total: self._events.put(("progress", (done, total)))
-                )
-        except Exception as exc:
-            self._events.put(("recognize_failed", exc))
-            return
-        self._events.put(("recognized", (os.path.basename(path), lines)))
-
-    def _read_whole_page(self, path: str):
-        """Qwen3-VL reads the page in one pass, so there is no per-line
-        confidence to colour by -- every line comes back unmarked."""
-        if self.page_reader is None:
-            self._events.put(("progress", (0, 1)))
-            self.status_from_worker("Загружаю модель чтения страницы (в первый раз качается ~6 ГБ)…")
-            self.page_reader = page_reader.PageReader()
-        self._events.put(("progress", (0, 1)))
-        texts = self.page_reader.read_file(
-            path, progress=lambda done, total: self._events.put(("progress", (done, total)))
-        )
-        return [
-            RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
-            for i, t in enumerate(texts)
-        ]
-
-    def status_from_worker(self, message: str):
-        self._events.put(("status", message))
-
-    def _update_progress(self, done: int, total: int):
-        # Whole-page mode has nothing to count -- one call in, one answer
-        # out -- so it gets a marching bar instead of a filling one.
-        if self.whole_page.get():
-            if str(self.progress["mode"]) != "indeterminate":
-                self.progress.configure(mode="indeterminate")
-                self.progress.start(12)
-            return
-        if str(self.progress["mode"]) != "determinate":
-            self.progress.stop()
-            self.progress.configure(mode="determinate")
-        self.progress.configure(value=done, maximum=max(total, 1))
-        self.status.set(f"Распознавание… строка {done} из {total}")
-
-    def _recognize_failed(self, exc: Exception):
-        self.progress.stop()
-        self.progress.pack_forget()
-        self.status.set("Ошибка распознавания")
-        self.open_btn.configure(state=tk.NORMAL)
-        if "out of memory" in str(exc).lower():
-            messagebox.showerror(
-                "Не хватило видеопамяти",
-                "Чтение страницы целиком не поместилось в видеокарту.\n\n"
-                "Снимите галочку «читать страницу целиком» и откройте фото "
-                "заново — построчный режим требует намного меньше памяти.",
-            )
-        else:
-            messagebox.showerror("Ошибка распознавания", str(exc))
-
-    def _show_results(self, filename: str, lines):
-        self.progress.stop()
-        self.progress.pack_forget()
-        if not lines:
-            self.status.set(f"{filename}: строки не найдены")
-            self.open_btn.configure(state=tk.NORMAL)
-            return
-
-        flagged = sum(1 for line in lines if line.confidence < MEDIUM_CONFIDENCE)
-        whole = self.whole_page.get()
-        self.text.delete("1.0", tk.END)
-        for i, line in enumerate(lines, start=1):
-            self.text.insert(tk.END, line.text + "\n")
-            if line.confidence < LOW_CONFIDENCE:
-                self.text.tag_add("low", f"{i}.0", f"{i}.end")
-            elif line.confidence < MEDIUM_CONFIDENCE:
-                self.text.tag_add("medium", f"{i}.0", f"{i}.end")
-
-        if whole:
-            tuned = getattr(self.page_reader, "adapter_loaded", False)
-            model = "дообученная модель" if tuned else "базовая модель"
-            self.status.set(f"{filename}: строк {len(lines)} (страница целиком, {model})")
-        else:
-            self.status.set(f"{filename}: строк {len(lines)}, требуют проверки {flagged}")
-        self.open_btn.configure(state=tk.NORMAL)
-        self.save_btn.configure(state=tk.NORMAL)
-        self.copy_btn.configure(state=tk.NORMAL)
-
     def _redraw_page(self):
         """Show the page at the current magnification. At 100% it fits the
         panel and sits centred; above that it overflows and scrolls."""
-        image = getattr(self, "_page_image", None)
+        image = self._page_image
         if image is None:
             return
         avail_w = max(self.canvas.winfo_width(), 1)
@@ -457,10 +474,185 @@ class HandwritingApp(tk.Tk):
         self._page_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         ox, oy = max(0, (avail_w - new_w) // 2), max(0, (avail_h - new_h) // 2)
         self._offset, self._shown = (ox, oy), (new_w, new_h)
-        self.canvas.delete("all")
-        self.canvas.create_image(ox, oy, anchor="nw", image=self._page_photo)
+        self.canvas.delete("page")
+        self.canvas.create_image(ox, oy, anchor="nw", image=self._page_photo, tags="page")
         self.canvas.configure(scrollregion=(0, 0, max(avail_w, new_w), max(avail_h, new_h)))
+        self._pin_glass()
         self._update_zoom_controls()
+
+    # -- models ---------------------------------------------------------------
+
+    def _drain_events(self):
+        try:
+            while True:
+                kind, payload = self._events.get_nowait()
+                if kind == "model_ready":
+                    self._model_ready(payload)
+                elif kind == "model_failed":
+                    self._model_failed(payload)
+                elif kind == "recognized":
+                    self._show_results(*payload)
+                elif kind == "recognize_failed":
+                    self._recognize_failed(*payload)
+                elif kind == "status":
+                    self.status.set(payload)
+                elif kind == "progress":
+                    self._update_progress(*payload)
+        except queue.Empty:
+            pass
+        self.after(50, self._drain_events)
+
+    def _load_model(self):
+        try:
+            recognizer = Recognizer()
+        except Exception as exc:  # surfacing the real reason beats a silent dead button
+            self._events.put(("model_failed", exc))
+            return
+        self._events.put(("model_ready", recognizer))
+
+    def _model_ready(self, recognizer: Recognizer):
+        self.recognizer = recognizer
+        where = "GPU" if recognizer.device == "cuda" else "CPU"
+        mode = "страница целиком" if self.whole_page else "по строкам"
+        self.status.set(f"Готово ({mode}, {where}). Откройте фото страницы.")
+        self._update_buttons()
+
+        # Explain the fall back to CPU once, up front -- otherwise the only
+        # symptom is that every page takes several minutes for no visible
+        # reason.
+        if getattr(recognizer, "device_warning", None):
+            messagebox.showwarning("Видеокарта не используется", recognizer.device_warning,
+                                   parent=self)
+
+    def _model_failed(self, exc: Exception):
+        self.status.set("Не удалось загрузить модель")
+        messagebox.showerror("Ошибка загрузки модели", str(exc), parent=self)
+
+    # -- actions --------------------------------------------------------------
+
+    def on_open(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Выберите фото страницы",
+            filetypes=[("Изображения", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"),
+                       ("Все файлы", "*.*")],
+        )
+        if not path:
+            return
+        image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            messagebox.showerror("Не открылось", "Этот файл не удалось прочитать как изображение.",
+                                 parent=self)
+            return
+        self._page_image, self._page_name = image, os.path.basename(path)
+        self._show_page()
+        self._start_recognition()
+
+    def on_rotate(self):
+        """A quarter turn clockwise, then read again: a phone often saves a
+        page on its side, and deskewing corrects a few degrees, not ninety."""
+        if self._page_image is None or self._busy:
+            return
+        self._page_image = cv2.rotate(self._page_image, cv2.ROTATE_90_CLOCKWISE)
+        self._show_page()
+        self._start_recognition()
+
+    def _show_page(self):
+        self._zoom = ZOOM_MIN
+        self.canvas.xview_moveto(0)
+        self.canvas.yview_moveto(0)
+        self._redraw_page()
+
+    def _start_recognition(self):
+        self.text.delete("1.0", tk.END)
+        self.ui.itemconfigure(self._text_window, state="hidden")
+        self.ui.itemconfigure(self._text_strip, state="hidden")
+        self._busy = True
+        self._update_buttons()
+        self.status.set(f"{self._page_name}: "
+                        + ("читаю страницу целиком…" if self.whole_page else "ищу строки…"))
+        # The mode is read here, on the main thread, and handed to the worker
+        # with a copy of the page: worker threads must not touch tkinter, nor
+        # a page a rotation could replace while they read it.
+        threading.Thread(target=self._recognize,
+                         args=(self._page_image.copy(), self._page_name, self.whole_page),
+                         daemon=True).start()
+
+    def _recognize(self, image, name: str, whole: bool):
+        try:
+            if whole:
+                lines = self._read_whole_page(image)
+            else:
+                lines = self.recognizer.recognize_page(
+                    image, progress=lambda done, total: self._events.put(("progress", (done, total)))
+                )
+        except Exception as exc:
+            self._events.put(("recognize_failed", (exc, whole)))
+            return
+        self._events.put(("recognized", (name, lines)))
+
+    def _read_whole_page(self, image):
+        """Qwen3-VL reads the page in one pass, so there is no per-line
+        confidence to colour by -- every line comes back unmarked."""
+        if self.page_reader is None:
+            self._events.put(("status", "Загружаю модель чтения страницы "
+                                        "(в первый раз качается ~6 ГБ)…"))
+            self.page_reader = page_reader.PageReader()
+        texts = self.page_reader.read_page(
+            image, progress=lambda done, total: self._events.put(("progress", (done, total)))
+        )
+        return [
+            RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
+            for i, t in enumerate(texts)
+        ]
+
+    def status_from_worker(self, message: str):
+        self._events.put(("status", message))
+
+    def _update_progress(self, done: int, total: int):
+        if self.whole_page:
+            self.status.set(f"{self._page_name}: читаю страницу целиком…")
+        else:
+            self.status.set(f"{self._page_name}: строка {done} из {total}")
+
+    def _recognize_failed(self, exc: Exception, whole: bool):
+        self._busy = False
+        if whole and "out of memory" in str(exc).lower():
+            # There is no switch to flip by hand any more, so the app flips it:
+            # the rest of this session reads by lines, which needs a fraction
+            # of the memory, and this page is read again that way.
+            self.whole_page = False
+            self.status.set("Не хватило видеопамяти — читаю по строкам")
+            self._start_recognition()
+            return
+        self.status.set("Ошибка распознавания")
+        self._update_buttons()
+        messagebox.showerror("Ошибка распознавания", str(exc), parent=self)
+
+    def _show_results(self, filename: str, lines):
+        self._busy = False
+        if not lines:
+            self.status.set(f"{filename}: строки не найдены")
+            self._update_buttons()
+            return
+
+        flagged = sum(1 for line in lines if line.confidence < MEDIUM_CONFIDENCE)
+        self.text.delete("1.0", tk.END)
+        for i, line in enumerate(lines, start=1):
+            self.text.insert(tk.END, line.text + "\n")
+            if line.confidence < LOW_CONFIDENCE:
+                self.text.tag_add("low", f"{i}.0", f"{i}.end")
+            elif line.confidence < MEDIUM_CONFIDENCE:
+                self.text.tag_add("medium", f"{i}.0", f"{i}.end")
+        self.ui.itemconfigure(self._text_window, state="normal")
+        self.ui.itemconfigure(self._text_strip, state="normal")
+
+        if self.whole_page:
+            tuned = getattr(self.page_reader, "adapter_loaded", False)
+            model = "дообученная модель" if tuned else "базовая модель"
+            self.status.set(f"{filename}: строк {len(lines)} ({model})")
+        else:
+            self.status.set(f"{filename}: строк {len(lines)}, требуют проверки {flagged}")
+        self._update_buttons()
 
     def _current_text(self) -> str:
         return self.text.get("1.0", tk.END).strip()
@@ -473,16 +665,13 @@ class HandwritingApp(tk.Tk):
 
     def on_save(self):
         path = filedialog.asksaveasfilename(
-            title="Сохранить распознанный текст",
-            defaultextension=".txt",
-            filetypes=[("Текстовый файл", "*.txt")],
+            parent=self, title="Сохранить распознанный текст",
+            defaultextension=".txt", filetypes=[("Текстовый файл", "*.txt")],
         )
         if not path:
             return
-
-        content = self._current_text()
         with open(path, "w", encoding="utf-8") as f:
-            f.write(content + "\n")
+            f.write(self._current_text() + "\n")
         self.status.set(f"Сохранено: {os.path.basename(path)}")
 
 
