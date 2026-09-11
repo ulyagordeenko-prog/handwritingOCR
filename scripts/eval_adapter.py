@@ -72,6 +72,16 @@ def main() -> int:
         print(f"  среднее {sum(scores)/len(scores):.1%}", flush=True)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    # The transcripts, not just the scores. The first run kept only numbers,
+    # so the three pages that collapsed to 77-96% under the adapter could not
+    # be looked at -- a loop and a misreading score alike.
+    with open(args.out.replace(".tsv", "_texts.txt"), "w", encoding="utf-8") as f:
+        for name, r in results.items():
+            f.write(f"===== {name} [{r.get('condition', '?')}]\n")
+            for label in ("база", "адаптер"):
+                f.write(f"--- {label} ({r.get(label, float('nan')):.1%})\n"
+                        f"{r.get('text_' + label, '')}\n")
+            f.write("\n")
     with open(args.out, "w", encoding="utf-8") as f:
         f.write("image\tcer_base\tcer_adapter\n")
         for name, r in results.items():
