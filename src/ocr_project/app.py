@@ -728,6 +728,10 @@ class HandwritingApp(tk.Tk):
 
 def main():
     app = HandwritingApp()
+    # Handwriter.exe waits for this line to know the window opened, rather
+    # than guessing at how long start-up takes. Under pythonw with no log
+    # attached, stdout is None and print is a no-op.
+    print("HANDWRITER_READY", flush=True)
     app.mainloop()
 
 
