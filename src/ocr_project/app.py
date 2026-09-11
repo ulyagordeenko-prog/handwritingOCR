@@ -192,8 +192,12 @@ class HandwritingApp(tk.Tk):
                             padx=8, pady=8, undo=True)
         text_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.text.yview)
         self.text.configure(yscrollcommand=text_scroll.set)
-        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Scrollbar first. pack() hands out space in packing order, and the text
+        # widget asks for 80 characters of width -- more than the 625 px its half
+        # of the fixed window has -- so packed second the scrollbar was pushed to
+        # x = 1308, outside a 1280-wide window, and simply never appeared.
         text_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         panes.add(right, weight=1)
 
         # Confidence is shown by tinting whole lines in place, so the text
@@ -332,11 +336,18 @@ class HandwritingApp(tk.Tk):
         self.copy_btn.configure(state=tk.DISABLED)
         self.progress.pack(side=tk.LEFT, padx=(16, 0))
         self.progress.configure(value=0, maximum=100)
-        threading.Thread(target=self._recognize, args=(path,), daemon=True).start()
+        # The mode is read here, on the main thread, and handed to the worker.
+        # Reading the checkbox from the worker was the one place that broke
+        # this file's own rule -- worker threads must not touch tkinter -- and
+        # it only worked because Tcl happens to marshal the call while
+        # mainloop is running. Without mainloop it raised "main thread is not
+        # in main loop" and every recognition failed.
+        whole = bool(self.whole_page.get())
+        threading.Thread(target=self._recognize, args=(path, whole), daemon=True).start()
 
-    def _recognize(self, path: str):
+    def _recognize(self, path: str, whole: bool):
         try:
-            if self.whole_page.get():
+            if whole:
                 lines = self._read_whole_page(path)
             else:
                 lines = self.recognizer.recognize_file(
