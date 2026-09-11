@@ -73,6 +73,7 @@ def main() -> int:
     remote("put", "scripts/bench_models.py", "ocr/scripts/bench_models.py")
     remote("put", "scripts/train_qwen.py", "ocr/scripts/train_qwen.py")
     remote("put", "scripts/eval_adapter.py", "ocr/scripts/eval_adapter.py")
+    remote("put", "scripts/fetch_hwr200.py", "ocr/scripts/fetch_hwr200.py")
     remote("put", "hwr200_pages.jsonl", "ocr/hwr200_pages.jsonl")
     remote("put", "bench/pages.jsonl", "ocr/bench/pages.jsonl")
 
