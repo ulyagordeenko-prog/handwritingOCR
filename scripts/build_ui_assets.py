@@ -1,19 +1,28 @@
 """
 Render the window background from the Figma design, once, at several scales.
 
-design/main.svg is the design exported from Figma at the window's size. Its
-static parts -- the frosted background, glass panels, button faces with their
-labels, the confidence legend, title-bar ornaments -- are drawn straight from
-it, so the app matches the design to the pixel without needing the design's
-fonts: Figma exported every label as an outline.
+The design comes as two exports:
 
-Three things in the export are placeholders for content that changes, and are
-removed before rendering so the app can draw the real thing in their place:
-the note in the middle of the title bar ("по середине будет имя файла ..."),
-the "100 %" zoom figure, and the two sample scrollbar thumbs.
+  design/window.svg   the whole window, 1280 x 760 -- frosted background and
+                      the title bar with the HANDWRITER mark and window
+                      controls. Only those two are taken from it.
+  design/content.svg  the working area -- toolbar, legend, photo and text
+                      panels with their scrollbars and zoom. This is the part
+                      that gets reworked, and it can be re-exported on its own.
+
+The two are composed into one picture, the working area placed where the
+window's own working area was. That spot is found, not assumed: the Open photo
+pill is located in both files and the difference is the offset.
+
+Static parts are drawn straight from the design, so the app matches it to the
+pixel without needing its fonts -- Figma exports every label as an outline.
+Placeholders for content that changes are removed first, so the app can draw
+the live version in their place: the note in the title bar, the "100 %"
+figures and the sample scrollbar thumbs. The build fails if any of them is
+not where expected, rather than baking one in under its live replacement.
 
 Rendered at the common Windows display scales rather than at start-up: a
-render takes 2-7 s, and the resulting PNGs are 0.1-0.4 MB each, so shipping
+render takes 2-7 s, and the resulting PNGs are 0.1-0.3 MB each, so shipping
 them costs less than making every launch wait -- and needs no SVG renderer on
 the user's machine.
 
@@ -24,28 +33,32 @@ import os
 import re
 import xml.etree.ElementTree as ET
 
-SVG_NS = "http://www.w3.org/2000/svg"
+SVG = "http://www.w3.org/2000/svg"
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SOURCE = os.path.join(ROOT, "design", "main.svg")
+WINDOW_SVG = os.path.join(ROOT, "design", "window.svg")
+CONTENT_SVG = os.path.join(ROOT, "design", "content.svg")
 OUT_DIR = os.path.join(ROOT, "src", "ocr_project", "assets", "ui")
 
 SCALES = (0.85, 1.0, 1.25, 1.5, 1.75, 2.0)
 WIDTH, HEIGHT = 1280, 760
+TITLE_BAR_BOTTOM = 41          # window.svg: everything below this is its old working area
 
-# Placeholders, identified by where they sit. Bounding boxes are in design
-# pixels, generous by a couple of pixels either way.
-PLACEHOLDER_PATHS = [
-    ("title-bar note", (505, 10, 922, 31)),
-    ("zoom figure",    (44, 732, 79, 744)),
+WINDOW_PLACEHOLDER_PATHS = [("title-bar note", (505, 10, 922, 31))]
+# content.svg coordinates
+CONTENT_PLACEHOLDER_PATHS = [
+    ("photo zoom figure", (34, 668, 91, 687)),
+    ("text zoom figure", (654, 668, 711, 687)),
 ]
-PLACEHOLDER_RECTS = [
-    ("vertical thumb",   {"x": "617", "y": "638.5", "width": "10", "height": "39"}),
-    ("horizontal thumb", {"transform": "rotate(90 581 712.5)"}),
-]
+THUMB_SIZE = ("10", "39")      # every sample thumb in the design is 10 x 39
+THUMBS_EXPECTED = 4
 
 
-def _path_bbox(d: str):
+def tag(el):
+    return el.tag.replace(f"{{{SVG}}}", "")
+
+
+def path_bbox(d):
     tokens = re.findall(r"[A-Za-z]|-?\d*\.?\d+(?:e-?\d+)?", d)
     xs, ys, cmd, i = [], [], None, 0
     while i < len(tokens):
@@ -64,47 +77,106 @@ def _path_bbox(d: str):
     return (min(xs), min(ys), max(xs), max(ys)) if xs and ys else None
 
 
-def _inside(box, area):
-    return (box[0] >= area[0] and box[1] >= area[1]
-            and box[2] <= area[2] and box[3] <= area[3])
+def inside(box, area):
+    return box[0] >= area[0] and box[1] >= area[1] and box[2] <= area[2] and box[3] <= area[3]
 
 
-def strip_placeholders(svg_text: str) -> str:
-    ET.register_namespace("", SVG_NS)
-    root = ET.fromstring(svg_text)
+def top_y(el):
+    """Top edge of an element, good enough to tell title bar from working area."""
+    t = tag(el)
+    if t == "path":
+        box = path_bbox(el.get("d", ""))
+        return box[1] if box else 0.0
+    if t in ("rect", "mask"):
+        transform = el.get("transform", "")
+        nums = [float(n) for n in re.findall(r"-?\d*\.?\d+", transform)]
+        if transform.startswith("matrix") and len(nums) == 6:
+            return nums[5]
+        if transform.startswith("rotate") and len(nums) == 3:
+            return nums[2]
+        return float(el.get("y", "0"))
+    if t == "g":
+        kids = [k for k in el if tag(k) in ("rect", "path", "g")]
+        return min((top_y(k) for k in kids), default=0.0)
+    return 0.0
+
+
+def pill_origin(root):
+    """(x, y) of the first 150 x 45 pill -- the Open photo button."""
+    for el in root.iter(f"{{{SVG}}}rect"):
+        if el.get("width") == "150" and el.get("height") == "45":
+            return float(el.get("x", "0")), float(el.get("y", "0"))
+    raise SystemExit("в макете не найдена кнопка Open photo (150 x 45)")
+
+
+def strip(root, paths, thumbs_expected=0):
     parent = {c: p for p in root.iter() for c in p}
     removed = []
+    for el in list(root.iter(f"{{{SVG}}}path")):
+        box = path_bbox(el.get("d", ""))
+        for name, area in paths:
+            if box and inside(box, area):
+                parent[el].remove(el)
+                removed.append(name)
+    thumbs = 0
+    if thumbs_expected:
+        for el in list(root.iter(f"{{{SVG}}}rect")):
+            if (el.get("width"), el.get("height")) == THUMB_SIZE:
+                parent[el].remove(el)
+                thumbs += 1
+    missing = {n for n, _ in paths} - set(removed)
+    if missing or thumbs != thumbs_expected:
+        # A re-exported design with a placeholder moved would otherwise render
+        # it baked into the background, under the live version.
+        raise SystemExit(f"не найдены заглушки: {sorted(missing)}; "
+                         f"ползунков {thumbs} из {thumbs_expected}")
+    return removed + [f"ползунков-примеров: {thumbs}"] * bool(thumbs_expected)
 
-    for el in list(root.iter(f"{{{SVG_NS}}}path")):
-        box = _path_bbox(el.get("d", ""))
-        if not box:
+
+def compose():
+    ET.register_namespace("", SVG)
+    window = ET.fromstring(open(WINDOW_SVG, encoding="utf-8").read())
+    content = ET.fromstring(open(CONTENT_SVG, encoding="utf-8").read())
+
+    # where the working area goes: the offset between the two Open photo pills,
+    # measured before window.svg's own working area is cleared away
+    wx, wy = pill_origin(window)
+    cx, cy = pill_origin(content)
+    dx, dy = wx - cx, wy - cy
+
+    report = strip(window, WINDOW_PLACEHOLDER_PATHS)
+    # keep window.svg's background and title bar, drop its old working area
+    kept = 0
+    for el in list(window):
+        if tag(el) == "defs":
             continue
-        for name, area in PLACEHOLDER_PATHS:
-            if _inside(box, area):
-                parent[el].remove(el)
-                removed.append(name)
+        if tag(el) == "g" and el.get("clip-path"):
+            kept += 1                    # the frosted background
+            continue
+        if top_y(el) >= TITLE_BAR_BOTTOM:
+            window.remove(el)
+        else:
+            kept += 1
+    report += strip(content, CONTENT_PLACEHOLDER_PATHS, THUMBS_EXPECTED)
 
-    for el in list(root.iter(f"{{{SVG_NS}}}rect")):
-        for name, attrs in PLACEHOLDER_RECTS:
-            if all(el.get(k) == v for k, v in attrs.items()):
-                parent[el].remove(el)
-                removed.append(name)
-
-    expected = {n for n, _ in PLACEHOLDER_PATHS} | {n for n, _ in PLACEHOLDER_RECTS}
-    missing = expected - set(removed)
-    if missing:
-        # A re-exported design with the placeholders moved would otherwise
-        # render them baked into the background, under the live versions.
-        raise SystemExit(f"не найдены заглушки в макете: {sorted(missing)}")
-    print("убраны заглушки:", ", ".join(removed))
-    return ET.tostring(root, encoding="unicode")
+    area = ET.SubElement(window, f"{{{SVG}}}g", {"transform": f"translate({dx} {dy})"})
+    for el in list(content):
+        if tag(el) == "defs":
+            defs = window.find(f"{{{SVG}}}defs")
+            for d in el:
+                defs.append(d)
+        else:
+            area.append(el)
+    print(f"рабочая область встала со сдвигом ({dx}, {dy}); от окна оставлено элементов: {kept}")
+    print("убраны заглушки:", ", ".join(report))
+    return ET.tostring(window, encoding="unicode")
 
 
 def main() -> int:
     import resvg_py
     from PIL import Image
 
-    svg = strip_placeholders(open(SOURCE, encoding="utf-8").read())
+    svg = compose()
     os.makedirs(OUT_DIR, exist_ok=True)
     for scale in SCALES:
         w, h = round(WIDTH * scale), round(HEIGHT * scale)

@@ -8,10 +8,11 @@ reads the whole photo in one pass -- more accurate, but it needs a card
 with about 8 GB, so the app uses it only where one is present. Text is
 editable, so fixing a mistake and exporting a clean transcript is one flow.
 
-The window is the Figma design in design/main.svg: its frosted background,
-glass panels, button faces and legend are pre-rendered images (see skin.py),
-and the live parts -- photo, text, status, zoom, scroll thumbs -- are laid
-over them at the design's own coordinates.
+The window is the Figma design (design/window.svg and design/content.svg):
+its frosted background, glass panels, button faces and legend are
+pre-rendered images (see skin.py), and the live parts -- photo, text, status,
+zoom figures, scroll thumbs -- are laid over them at the design's own
+coordinates.
 """
 from __future__ import annotations
 
@@ -35,6 +36,10 @@ LOW_CONFIDENCE = 0.80
 MEDIUM_CONFIDENCE = 0.90
 
 ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 8.0, 1.25
+# Text zooms by type size. It may go below 100% -- smaller type shows more of
+# a long transcript at once -- where the photo never goes below fitting.
+TEXT_ZOOM_MIN, TEXT_ZOOM_MAX = 0.6, 3.0
+TEXT_PX = 17
 
 # Painted where the window should be see-through -- outside its rounded
 # corners. Magenta, because the design is greys and a key colour that turned
@@ -112,9 +117,8 @@ class ThinScrollbar:
     the background image, with the arrow circles at either end clickable.
     Speaks the same set()/command protocol as a ttk.Scrollbar."""
 
-    def __init__(self, app, orient, spec, command, base=None):
+    def __init__(self, app, orient, spec, command):
         self.app, self.orient, self.command = app, orient, command
-        self.base = base            # flat colour under the thumb, if not glass
         self.track = skin.scaled(spec["track"], app.s)
         self.item, self._image, self._span = None, None, (0.0, 1.0)
         self._grab = None
@@ -143,7 +147,7 @@ class ThinScrollbar:
         box = (pos, t, pos + size, b) if self.orient == "horizontal" else (l, pos, r, pos + size)
         thickness = (b - t) if self.orient == "horizontal" else (r - l)
         self._image = ImageTk.PhotoImage(
-            skin.thumb_image(self.app._bg_pil, box, thickness / 2, self.base).convert("RGB"))
+            skin.thumb_image(self.app._bg_pil, box, thickness / 2).convert("RGB"))
         if self.item is None:
             self.item = ui.create_image(box[0], box[1], anchor="nw", image=self._image)
             ui.tag_bind(self.item, "<ButtonPress-1>", self._press)
@@ -317,14 +321,14 @@ class HandwritingApp(tk.Tk):
         self.hscroll = ThinScrollbar(self, "horizontal", skin.HSCROLL, self.canvas.xview)
         self.canvas.configure(yscrollcommand=self._on_yscroll, xscrollcommand=self._on_xscroll)
 
-        self.zoom_out = SkinButton(self, skin.ZOOM_OUT_HIT, lambda: self._zoom_by(1 / ZOOM_STEP),
-                                   shape="circle")
         self.zoom_in = SkinButton(self, skin.ZOOM_IN_HIT, lambda: self._zoom_by(ZOOM_STEP),
                                   shape="circle")
+        self.zoom_out = SkinButton(self, skin.ZOOM_OUT_HIT, lambda: self._zoom_by(1 / ZOOM_STEP),
+                                   shape="circle")
+        self._zoom_font = ("Segoe UI", -round(skin.ZOOM_FONT_PX * s))
         zx, zy = skin.ZOOM_LABEL_CENTER
         self._zoom_item = self.ui.create_text(zx * s, zy * s, text="100 %", anchor="center",
-                                              fill=skin.TEXT_COLOR,
-                                              font=("Segoe UI", -round(10 * s)))
+                                              fill=skin.TEXT_COLOR, font=self._zoom_font)
 
         self._page_photo = None
         self._zoom = ZOOM_MIN            # 1.0 = the whole page fits the panel
@@ -342,21 +346,31 @@ class HandwritingApp(tk.Tk):
         self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
         self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
         self.canvas.bind("<Double-Button-1>", lambda e: self._set_zoom(ZOOM_MIN))
+        # Keyboard zoom acts on whichever panel has the focus: typing in the
+        # transcript and pressing Ctrl+plus should enlarge the text, not the
+        # photo on the other side of the window.
         for key in ("<Control-plus>", "<Control-equal>", "<Control-KP_Add>"):
-            self.bind(key, lambda e: self._zoom_by(ZOOM_STEP))
+            self.bind(key, lambda e: self._zoom_key(ZOOM_STEP))
         for key in ("<Control-minus>", "<Control-KP_Subtract>"):
-            self.bind(key, lambda e: self._zoom_by(1 / ZOOM_STEP))
-        self.bind("<Control-0>", lambda e: self._set_zoom(ZOOM_MIN))
+            self.bind(key, lambda e: self._zoom_key(1 / ZOOM_STEP))
+        self.bind("<Control-0>", lambda e: self._zoom_key(None))
         self._update_zoom_controls()
 
     def _build_text_view(self):
         s = self.s
         l, t, r, b = skin.scaled(skin.TEXT_VIEW, s)
         base = skin.mean_color(self._bg_pil, skin.scaled(skin.TEXT_PANEL, s))
+        self._text_zoom = 1.0
+        self._text_font = tkfont.Font(family="Georgia", size=-round(TEXT_PX * s))
         # A Text widget cannot show an image under its lines, so it takes the
         # panel's average colour, and stays hidden until there is text: the
         # empty panel is then the design's glass exactly.
-        self.text = tk.Text(self.ui, wrap=tk.WORD, font=("Georgia", -round(17 * s)),
+        #
+        # No wrapping: one line of transcript is one line of the page, and the
+        # design gives the text a horizontal scrollbar of its own, which would
+        # have nothing to scroll if long lines folded -- once the type is
+        # enlarged, they run past the edge and the scrollbar reaches them.
+        self.text = tk.Text(self.ui, wrap=tk.NONE, font=self._text_font,
                             bg=skin.hex_color(base), fg=skin.TEXT_COLOR, bd=0,
                             highlightthickness=0, padx=round(14 * s), pady=round(12 * s),
                             undo=True, insertbackground=skin.TEXT_COLOR,
@@ -367,15 +381,52 @@ class HandwritingApp(tk.Tk):
         # stays one editable block you can select and copy across.
         self.text.tag_configure("low", background=skin.tint(base, skin.LOW_TINT))
         self.text.tag_configure("medium", background=skin.tint(base, skin.MEDIUM_TINT))
-        # The strip beside the text, where its scrollbar lives, takes the same
-        # flat colour -- left as glass it showed as a lighter band down the
-        # panel's right edge, a seam between two slightly different greys.
-        pl, pt, pr, pb = skin.scaled(skin.TEXT_PANEL, s)
-        self._text_strip = self.ui.create_rectangle(r, pt + 1, pr - 1, pb - 1, outline="",
-                                                    fill=skin.hex_color(base), state="hidden")
-        self.tscroll = ThinScrollbar(self, "vertical", {"track": skin.TEXT_SCROLL_TRACK},
-                                     self.text.yview, base=base)
-        self.text.configure(yscrollcommand=self.tscroll.set)
+
+        self.tvscroll = ThinScrollbar(self, "vertical", skin.TEXT_VSCROLL, self.text.yview)
+        self.thscroll = ThinScrollbar(self, "horizontal", skin.TEXT_HSCROLL, self.text.xview)
+        self.text.configure(yscrollcommand=self.tvscroll.set, xscrollcommand=self.thscroll.set)
+
+        self.text_zoom_in = SkinButton(self, skin.TEXT_ZOOM_IN_HIT,
+                                       lambda: self._set_text_zoom(self._text_zoom * ZOOM_STEP),
+                                       shape="circle")
+        self.text_zoom_out = SkinButton(self, skin.TEXT_ZOOM_OUT_HIT,
+                                        lambda: self._set_text_zoom(self._text_zoom / ZOOM_STEP),
+                                        shape="circle")
+        zx, zy = skin.TEXT_ZOOM_LABEL_CENTER
+        self._text_zoom_item = self.ui.create_text(zx * s, zy * s, text="100 %", anchor="center",
+                                                   fill=skin.TEXT_COLOR, font=self._zoom_font)
+        self.text.bind("<Control-MouseWheel>", self._on_text_wheel_zoom)
+        self._update_text_zoom_controls()
+
+    def _on_text_wheel_zoom(self, event):
+        self._set_text_zoom(self._text_zoom * (ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP))
+        return "break"          # or the Text widget also scrolls by the same turn
+
+    def _set_text_zoom(self, zoom):
+        zoom = min(TEXT_ZOOM_MAX, max(TEXT_ZOOM_MIN, zoom))
+        # snap onto 100% when a step lands next to it, so zooming out and back
+        # in returns to exactly the designed size rather than 99% or 101%
+        if abs(zoom - 1.0) < 0.02:
+            zoom = 1.0
+        self._text_zoom = zoom
+        self._text_font.configure(size=-round(TEXT_PX * self.s * zoom))
+        self._update_text_zoom_controls()
+
+    def _update_text_zoom_controls(self):
+        self.ui.itemconfigure(self._text_zoom_item, text=f"{self._text_zoom * 100:.0f} %")
+        shown = self.ui.itemcget(self._text_window, "state") != "hidden"
+        self.text_zoom_in.set_enabled(shown and self._text_zoom < TEXT_ZOOM_MAX - 1e-6)
+        self.text_zoom_out.set_enabled(shown and self._text_zoom > TEXT_ZOOM_MIN + 1e-6)
+
+    def _zoom_key(self, factor):
+        """Keyboard zoom: the text when it has the focus, else the photo.
+        factor None means back to the designed size."""
+        if self.focus_get() is self.text:
+            self._set_text_zoom(1.0 if factor is None else self._text_zoom * factor)
+        elif factor is None:
+            self._set_zoom(ZOOM_MIN)
+        else:
+            self._zoom_by(factor)
 
     def _render_status(self):
         """Fit the status into the space between the logo and the window
@@ -565,7 +616,7 @@ class HandwritingApp(tk.Tk):
     def _start_recognition(self):
         self.text.delete("1.0", tk.END)
         self.ui.itemconfigure(self._text_window, state="hidden")
-        self.ui.itemconfigure(self._text_strip, state="hidden")
+        self._update_text_zoom_controls()
         self._busy = True
         self._update_buttons()
         self.status.set(f"{self._page_name}: "
@@ -644,7 +695,7 @@ class HandwritingApp(tk.Tk):
             elif line.confidence < MEDIUM_CONFIDENCE:
                 self.text.tag_add("medium", f"{i}.0", f"{i}.end")
         self.ui.itemconfigure(self._text_window, state="normal")
-        self.ui.itemconfigure(self._text_strip, state="normal")
+        self._update_text_zoom_controls()
 
         if self.whole_page:
             tuned = getattr(self.page_reader, "adapter_loaded", False)

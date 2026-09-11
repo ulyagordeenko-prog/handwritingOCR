@@ -1,10 +1,12 @@
 """
-The window's look, taken from the Figma design (design/main.svg).
+The window's look, taken from the Figma design (design/window.svg for the
+background and title bar, design/content.svg for the working area).
 
-Every coordinate here is in design pixels -- the design is drawn at exactly
-the window's logical size, 1280 x 760 -- and read straight out of the SVG
-export rather than measured off a picture. The app multiplies them by the
-display scale it settled on.
+Every coordinate here is in window pixels -- the window's logical size is
+1280 x 760 -- read straight out of the SVG exports rather than measured off a
+picture. The working area's coordinates are content.svg's own plus the offset
+it is placed at, (24.5, 55), which the asset build finds by matching the
+Open photo pill in both files. The app multiplies them by the display scale.
 
 The background, glass panels, button faces with their labels and the legend
 are pre-rendered from the design by scripts/build_ui_assets.py; the app lays
@@ -40,27 +42,47 @@ BUTTONS = {
     "rotate": (553.5, 55, 56, 45),
 }
 
+# The photo and text panels are built alike: a 570 x 570 glass panel, a
+# vertical scrollbar beside it, a horizontal one under it, and a zoom below
+# that -- "+" on the left, "-" on the right, the figure between them.
+# "track" is where a thumb travels, between the two arrows; "back" and "fwd"
+# are the arrows' hit areas, a little larger than the 12 px circles drawn.
+
 # photo panel ---------------------------------------------------------------
-PHOTO_PANEL = (29.5, 115, 570, 580)
-PHOTO_VIEW = (31, 117, 567, 576)        # inside the panel's 1 px white edge
+PHOTO_PANEL = (29, 115, 570, 570)
+PHOTO_VIEW = (31, 117, 566, 566)        # inside the panel's 1 px white edge
 VSCROLL = {
-    "track": (617, 130, 10, 550),       # thumb travels between the two arrows
-    "back":  (614, 114, 16, 16),        # up arrow, hit area
-    "fwd":   (614, 680, 16, 16),        # down arrow
+    "track": (616.5, 130.5, 10, 539),
+    "back":  (613.5, 114.5, 16, 16),    # up arrow
+    "fwd":   (613.5, 669.5, 16, 16),    # down arrow
 }
 HSCROLL = {
-    "track": (44, 712.5, 540, 10),
-    "back":  (28, 710, 16, 16),         # left arrow
-    "fwd":   (584, 710, 16, 16),        # right arrow
+    "track": (44, 702.5, 539, 10),
+    "back":  (28, 699.5, 16, 16),       # left arrow
+    "fwd":   (583, 699.5, 16, 16),      # right arrow
 }
-ZOOM_OUT_HIT = (27, 728.5, 18, 18)
-ZOOM_IN_HIT = (77, 728.5, 18, 18)
-ZOOM_LABEL_CENTER = (61.5, 737.5)
+ZOOM_IN_HIT = (29.5, 721, 24, 24)       # the "+" circle
+ZOOM_OUT_HIT = (118.5, 721, 24, 24)     # the "-" circle
+ZOOM_LABEL_CENTER = (87.15, 732.5)
 
 # text panel ----------------------------------------------------------------
-TEXT_PANEL = (648.5, 115, 600, 630)
-TEXT_VIEW = (650, 117, 580, 626)
-TEXT_SCROLL_TRACK = (1234, 124, 10, 612)
+TEXT_PANEL = (649, 115, 570, 570)
+TEXT_VIEW = (651, 117, 566, 566)
+TEXT_VSCROLL = {
+    "track": (1236.5, 130.5, 10, 539),
+    "back":  (1233.5, 114.5, 16, 16),
+    "fwd":   (1233.5, 669.5, 16, 16),
+}
+TEXT_HSCROLL = {
+    "track": (664, 702.5, 539, 10),
+    "back":  (648, 699.5, 16, 16),
+    "fwd":   (1203, 699.5, 16, 16),
+}
+TEXT_ZOOM_IN_HIT = (649.5, 721, 24, 24)
+TEXT_ZOOM_OUT_HIT = (738.5, 721, 24, 24)
+TEXT_ZOOM_LABEL_CENTER = (707.15, 732.5)
+# the "100 %" figures are drawn ~13 px tall in the design
+ZOOM_FONT_PX = 19
 
 TEXT_COLOR = "#1c1c1c"
 STATUS_COLOR = "#141414"
@@ -126,15 +148,11 @@ def button_states(crop: Image.Image, shape: str, radius: float) -> dict:
     return {k: Image.composite(v, crop, m) for k, v in looks.items()}
 
 
-def thumb_image(background: Image.Image, box, radius: float, base=None) -> Image.Image:
+def thumb_image(background: Image.Image, box, radius: float) -> Image.Image:
     """A scrollbar thumb in the design's style -- white at 15% with a white
-    edge, fully rounded -- composited over what it sits on: the background
-    image, or a flat colour where a widget has covered the glass."""
+    edge, fully rounded -- composited over the background it sits on."""
     l, t, r, b = box
-    if base is None:
-        under = background.crop(box).convert("RGBA")
-    else:
-        under = Image.new("RGBA", (r - l, b - t), tuple(base) + (255,))
+    under = background.crop(box).convert("RGBA")
     overlay = Image.new("RGBA", under.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     draw.rounded_rectangle((0, 0, r - l - 1, b - t - 1), radius=radius,
