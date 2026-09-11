@@ -47,3 +47,7 @@ hwr200_pages.jsonl
 smoke_pages.jsonl
 hwr200_build*.log
 checkpoints_remote/
+
+# сборка установщика: промежуточные файлы PyInstaller и превью иконки
+installer/_build/
+installer/handwriter_preview.png
