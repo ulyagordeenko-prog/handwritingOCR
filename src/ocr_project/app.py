@@ -281,7 +281,9 @@ class HandwritingApp(tk.Tk):
                 self.text.tag_add("medium", f"{i}.0", f"{i}.end")
 
         if whole:
-            self.status.set(f"{filename}: строк {len(lines)} (страница целиком)")
+            tuned = getattr(self.page_reader, "adapter_loaded", False)
+            model = "дообученная модель" if tuned else "базовая модель"
+            self.status.set(f"{filename}: строк {len(lines)} (страница целиком, {model})")
         else:
             self.status.set(f"{filename}: строк {len(lines)}, требуют проверки {flagged}")
         self.open_btn.configure(state=tk.NORMAL)

@@ -23,6 +23,12 @@ from .segmentation import crop_to_page, deskew, split_pages
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 
+# LoRA adapter trained on HWR200: 200 adult hands, each text scanned and
+# photographed in good and poor light. Loaded on top of the base model when
+# present; the app works without it, and whether it ships is decided by the
+# held-out measurement, not by its existence.
+DEFAULT_ADAPTER = "checkpoints/qwen3vl-hwr200"
+
 # The task is transcription, not comprehension: the model must copy what the
 # strokes say, the way a person reading someone else's handwriting does, and
 # never substitute a word it finds more plausible. Hence the explicit ban on
@@ -159,7 +165,9 @@ def _is_filler(text: str) -> bool:
 
 
 class PageReader:
-    def __init__(self, quantize: bool = True):
+    def __init__(self, quantize: bool = True, adapter_dir: str | None = DEFAULT_ADAPTER):
+        import os
+
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         kwargs = {"dtype": torch.bfloat16, "device_map": "cuda"}
@@ -174,6 +182,14 @@ class PageReader:
 
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
+
+        self.adapter_loaded = False
+        if adapter_dir and os.path.isfile(os.path.join(adapter_dir, "adapter_config.json")):
+            from peft import PeftModel
+
+            self.model = PeftModel.from_pretrained(self.model, adapter_dir)
+            self.model.eval()
+            self.adapter_loaded = True
 
     def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None) -> list[str]:
         """Read a photographed page.
