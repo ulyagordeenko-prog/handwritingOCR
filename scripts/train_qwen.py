@@ -35,6 +35,11 @@ from torch.utils.data import Dataset
 
 MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 
+# Fields shaped (batch, sequence). Everything else the processor returns --
+# pixel_values, image_grid_thw -- is laid out per image patch and must pass
+# through untouched.
+TOKEN_FIELDS = ("input_ids", "attention_mask", "mm_token_type_ids")
+
 # The training prompt must be the prompt used at inference, or the model is
 # tuned for a question the app never asks.
 from ocr_project.page_reader import PROMPT
@@ -76,7 +81,11 @@ class Pages(Dataset):
         batch = self.processor.apply_chat_template(
             messages, tokenize=True, return_dict=True, return_tensors="pt",
         )
-        item = {k: v[0] for k, v in batch.items()}
+        # Only the token fields carry a batch dimension. pixel_values is
+        # (patches, features) and image_grid_thw is (images, 3); taking [0] of
+        # those -- which the first version of this did for every field -- keeps
+        # one image patch out of ~5000 and throws the rest of the page away.
+        item = {k: (v[0] if k in TOKEN_FIELDS else v) for k, v in batch.items()}
 
         # Loss on the answer only: the prompt and the image are the question,
         # and training the model to predict its own question teaches nothing.
@@ -93,8 +102,10 @@ class Pages(Dataset):
 
 def collate(batch):
     """One sample per step: pages differ in size, and padding image grids
-    together costs more memory than the gradient accumulation it saves."""
-    return {k: v.unsqueeze(0) if v.dim() >= 1 else v for k, v in batch[0].items()}
+    together costs more memory than the gradient accumulation it saves.
+    Token fields get their batch dimension back; image fields never lost it."""
+    return {k: (v.unsqueeze(0) if k in TOKEN_FIELDS + ("labels",) else v)
+            for k, v in batch[0].items()}
 
 
 def main() -> int:
