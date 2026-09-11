@@ -173,7 +173,9 @@ def main() -> int:
         args=TrainingArguments(
             output_dir=args.out, num_train_epochs=args.epochs,
             per_device_train_batch_size=1, gradient_accumulation_steps=args.accum,
-            learning_rate=args.lr, lr_scheduler_type="cosine", warmup_ratio=0.03,
+            # transformers 5 dropped warmup_ratio; the same 3% expressed in steps
+            learning_rate=args.lr, lr_scheduler_type="cosine",
+            warmup_steps=max(1, int(0.03 * len(train) * args.epochs / args.accum)),
             bf16=True, logging_steps=10, save_strategy="steps", save_steps=200,
             save_total_limit=3, report_to=[], remove_unused_columns=False,
             dataloader_num_workers=0, gradient_checkpointing=True,
