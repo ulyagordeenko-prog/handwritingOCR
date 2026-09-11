@@ -40,3 +40,9 @@ bench/
 # обучение и подготовка данных нужны на арендованной машине — держим в репозитории
 !scripts/train_qwen.py
 !scripts/hwr200_pages.py
+
+# данные обучения и скачанные с сервера адаптеры — не часть приложения
+hwr200_pages.jsonl
+smoke_pages.jsonl
+hwr200_build*.log
+checkpoints_remote/
