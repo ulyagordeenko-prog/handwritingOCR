@@ -538,8 +538,13 @@ def _centre(root, w, h):
     root.geometry(f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{(root.winfo_screenheight() - h) // 3}")
 
 
-def run_with_window(plan: str, shortcuts=True) -> bool:
-    """Show progress while a plan runs. True if it finished."""
+def run_with_window(plan: str, shortcuts=True, quiet=False) -> bool:
+    """Show progress while a plan runs. True if it finished.
+
+    `quiet` is for work nobody asked for -- the update that happens by itself
+    at every launch. A failure there must not turn into a question: the app
+    that is already installed still opens, on the version it has.
+    """
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -596,6 +601,9 @@ def run_with_window(plan: str, shortcuts=True) -> bool:
                     return
                 elif kind == "failed":
                     busy.stop()
+                    if quiet:
+                        root.destroy()
+                        return
                     again = messagebox.askretrycancel(PLAN_TITLES[plan], value, parent=root)
                     if again:
                         busy.start(12)
@@ -785,13 +793,15 @@ def main(argv=None) -> int:
             bring_forward(running[0])
             return 0
         splash = Splash()
-        newest = splash.run(latest_commit)
-        # an unrecorded version counts as old, or it would never be updated
-        if newest and newest != load_state().get("sha") and not splash.closed and splash.ask(
-                APP_NAME, "Вышла новая версия приложения. Обновить сейчас?\n\n"
-                          "Обычно это минута, если менялись библиотеки — несколько минут."):
+        newest = splash.run(latest_commit, "Проверяю обновления…")
+        # An update is not a question any more: nobody wants to decide this at
+        # every launch, and the answer is always yes. An unrecorded version
+        # counts as old, or it would never be updated. Most updates change only
+        # the app's own files and take seconds; the window says what is going
+        # on, and closing it carries on to the app as it was.
+        if newest and newest != load_state().get("sha") and not splash.closed:
             splash.close()
-            run_with_window("update", shortcuts)
+            run_with_window("update", shortcuts, quiet=True)
             splash = Splash()
     else:
         if not enough_disk() or not run_with_window("install", shortcuts):
