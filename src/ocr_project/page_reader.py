@@ -14,6 +14,7 @@ The weights are ~17 GB in full precision, so they are loaded quantized to
 """
 from __future__ import annotations
 
+import os
 import re
 
 import torch
@@ -60,6 +61,10 @@ PROMPT = (
 
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
+
+# Below that floor the model can still be read from ordinary memory, a layer
+# at a time -- but 16-bit weights are ~16 GB, so the memory has to be there.
+MIN_RAM_GB_SPLIT = 20
 
 
 def enough_vram() -> bool:
@@ -164,21 +169,79 @@ def _is_filler(text: str) -> bool:
     return len(stripped) >= 4 and len(set(stripped)) == 1
 
 
-class PageReader:
-    def __init__(self, quantize: bool = True, adapter_dir: str | None = DEFAULT_ADAPTER):
-        import os
+def _ram_gb() -> float:
+    """How much memory this machine has, in gigabytes."""
+    try:
+        if hasattr(os, "sysconf") and "SC_PHYS_PAGES" in os.sysconf_names:
+            return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
+        import ctypes
 
+        class Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        status = Status()
+        status.dwLength = ctypes.sizeof(Status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        return status.ullTotalPhys / 1024**3
+    except Exception:
+        return 0.0
+
+
+def can_split() -> bool:
+    """Can a card too small for the model still read a page, with the rest of
+    the model kept in ordinary memory?
+
+    A card is still needed -- the weights are copied into it layer by layer --
+    and enough memory to hold the ones waiting their turn.
+    """
+    from .recognizer import _usable_device
+
+    device, _ = _usable_device()
+    return device == "cuda" and _ram_gb() >= MIN_RAM_GB_SPLIT
+
+
+def _split_across(gpu_reserve_gb: float = 1.0) -> dict:
+    """How much of the model each device may hold."""
+    free = 0.0
+    try:
+        free = torch.cuda.mem_get_info()[0] / 1024**3
+    except Exception:
+        pass
+    gpu = max(1, int(free - gpu_reserve_gb))
+    cpu = max(8, int(_ram_gb()) - 8)
+    return {0: f"{gpu}GiB", "cpu": f"{cpu}GiB"}
+
+
+class PageReader:
+    def __init__(self, quantize: bool = True, adapter_dir: str | None = DEFAULT_ADAPTER,
+                 offload: bool = False):
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
-        kwargs = {"dtype": torch.bfloat16, "device_map": "cuda"}
-        if quantize:
-            from transformers import BitsAndBytesConfig
+        if offload:
+            # The model lives in ordinary memory and is copied into the card a
+            # layer at a time. Quantizing it as well does not work: with 4-bit
+            # weights the layers left behind arrive as empty placeholders and
+            # generation dies on the first of them ("cannot copy out of meta
+            # tensor"). Plain 16-bit both loads and runs -- and measured twice
+            # as fast as 32-bit on the small card this was tried on.
+            kwargs = {"dtype": torch.float16, "device_map": "auto",
+                      "max_memory": _split_across()}
+        else:
+            kwargs = {"dtype": torch.bfloat16, "device_map": "cuda"}
+            if quantize:
+                from transformers import BitsAndBytesConfig
 
-            kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-            )
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_quant_type="nf4",
+                )
 
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
@@ -230,7 +293,9 @@ class PageReader:
         inputs = self.processor.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True,
             return_dict=True, return_tensors="pt",
-        ).to("cuda")
+            # not "cuda": with part of the model in RAM the first layer decides
+            # where the input goes, and accelerate moves it on from there
+        ).to(getattr(self.model, "device", "cuda"))
 
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
@@ -239,6 +304,22 @@ class PageReader:
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
         return trim_runaway([line for line in text.splitlines() if line.strip()])
+
+    def read_region(self, region_bgr, progress=None) -> list[str]:
+        """Read exactly the piece someone drew a box around.
+
+        None of read_page's preparation happens here. Cropping and
+        straightening look for a sheet inside a photograph, and a selection is
+        already the part that matters; spread splitting would be worse than
+        useless, cutting a wide stamp down the middle because its shape looks
+        like an open book.
+        """
+        if progress:
+            progress(0, 1)
+        lines = self._read_one(region_bgr)
+        if progress:
+            progress(1, 1)
+        return lines
 
     def read_file(self, path: str, progress=None) -> list[str]:
         import cv2

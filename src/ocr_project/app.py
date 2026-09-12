@@ -36,6 +36,7 @@ LOW_CONFIDENCE = 0.80
 MEDIUM_CONFIDENCE = 0.90
 
 ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 8.0, 1.25
+SELECT_HINT = "Обведите участок мышью — прочитаю только его"
 # Text zooms by type size. It may go below 100% -- smaller type shows more of
 # a long transcript at once -- where the photo never goes below fitting.
 TEXT_ZOOM_MIN, TEXT_ZOOM_MAX = 0.6, 3.0
@@ -189,6 +190,12 @@ class HandwritingApp(tk.Tk):
         self._page_image = None
         self._page_name = ""
         self._busy = False
+        self._region = None          # the piece of the page to read, in image pixels
+        self._selecting = False
+        self._select_from = (0, 0)
+        # set once the person has agreed to whole-page reading on a card too
+        # small for it, which puts part of the model on the processor
+        self._slow_whole_page = False
 
         # Worker threads must not touch tkinter (not even via .after());
         # they post messages here and the main thread drains the queue.
@@ -330,6 +337,19 @@ class HandwritingApp(tk.Tk):
         self._zoom_item = self.ui.create_text(zx * s, zy * s, text="100 %", anchor="center",
                                               fill=skin.TEXT_COLOR, font=self._zoom_font)
 
+        # Which way the page is read, on the empty stretch of the bottom bar.
+        # The hardware picks the first mode, but both are offered everywhere:
+        # whole-page reads more accurately, line-by-line marks the lines it
+        # doubts, and only the person reading knows which they need now.
+        mx, my = skin.READ_MODE_RIGHT
+        self._mode_item = self.ui.create_text(mx * s, my * s, text="", anchor="e",
+                                              fill=skin.TEXT_COLOR, font=self._zoom_font)
+        self.ui.tag_bind(self._mode_item, "<Button-1>", self._toggle_mode)
+        self.ui.tag_bind(self._mode_item, "<Enter>",
+                         lambda e: self.ui.configure(cursor="hand2"))
+        self.ui.tag_bind(self._mode_item, "<Leave>", lambda e: self.ui.configure(cursor=""))
+        self._update_mode_label()
+
         self._page_photo = None
         self._zoom = ZOOM_MIN            # 1.0 = the whole page fits the panel
         self._offset = (0, 0)
@@ -343,9 +363,12 @@ class HandwritingApp(tk.Tk):
         self.canvas.bind("<Shift-MouseWheel>",
                          lambda e: self.canvas.xview_scroll(-e.delta // 120, "units"))
         # drag to move around an enlarged page; double-click to fit it again
-        self.canvas.bind("<ButtonPress-1>", lambda e: self.canvas.scan_mark(e.x, e.y))
-        self.canvas.bind("<B1-Motion>", lambda e: self.canvas.scan_dragto(e.x, e.y, gain=1))
-        self.canvas.bind("<Double-Button-1>", lambda e: self._set_zoom(ZOOM_MIN))
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_motion)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", self._on_double_click)
+        self.canvas.bind("<Enter>", self._hint_on)
+        self.canvas.bind("<Leave>", self._hint_off)
         # Keyboard zoom acts on whichever panel has the focus: typing in the
         # transcript and pressing Ctrl+plus should enlarge the text, not the
         # photo on the other side of the window.
@@ -447,6 +470,8 @@ class HandwritingApp(tk.Tk):
         self.buttons["save"].set_enabled(has_text)
         self.buttons["copy"].set_enabled(has_text)
         self.buttons["rotate"].set_enabled(ready and self._page_image is not None)
+        # the mode switch greys out while a page is being read
+        self.ui.itemconfigure(self._mode_item, fill=skin.TEXT_COLOR if ready else "#8a8a8a")
 
     # -- photo view -----------------------------------------------------------
 
@@ -467,7 +492,9 @@ class HandwritingApp(tk.Tk):
         has_page = self._page_image is not None
         self.zoom_out.set_enabled(has_page and self._zoom > ZOOM_MIN)
         self.zoom_in.set_enabled(has_page and self._zoom < ZOOM_MAX)
-        self.canvas.configure(cursor="fleur" if self._zoom > ZOOM_MIN else "")
+        # crosshair where a drag draws a box, the hand where it moves the photo
+        self.canvas.configure(cursor="fleur" if self._zoom > ZOOM_MIN
+                              else ("crosshair" if has_page else ""))
 
     def _zoom_by(self, factor, anchor=None):
         self._set_zoom(self._zoom * factor, anchor)
@@ -502,6 +529,105 @@ class HandwritingApp(tk.Tk):
     def _on_wheel_zoom(self, event):
         self._zoom_by(ZOOM_STEP if event.delta > 0 else 1 / ZOOM_STEP, (event.x, event.y))
 
+    # -- reading one piece of the page ----------------------------------------
+    #
+    # A stamp in a passport is a few lines of writing inside a large photograph
+    # of a book. Reading the whole frame spends the model's attention on the
+    # cover, the fingers and the printed form around it; boxing the stamp hands
+    # it the writing and nothing else.
+
+    def _on_press(self, event):
+        self.canvas.scan_mark(event.x, event.y)
+        # At the size that fits the panel there is nothing to drag the photo
+        # around by, so a drag there means "read this bit". Magnified, a drag
+        # still moves the photo and Shift draws the box instead.
+        self._selecting = (self._page_image is not None and not self._busy
+                           and (self._zoom <= ZOOM_MIN + 1e-6 or bool(event.state & 0x0001)))
+        self._select_from = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
+    def _on_motion(self, event):
+        if not self._selecting:
+            self.canvas.scan_dragto(event.x, event.y, gain=1)
+            return
+        x0, y0 = self._select_from
+        self._draw_box(x0, y0, self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+
+    def _on_release(self, event):
+        if not self._selecting:
+            return
+        self._selecting = False
+        x0, y0 = self._select_from
+        region = self._to_image_box(x0, y0, self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if region is None:              # a click, or a box too small to hold writing
+            self.canvas.delete("region")
+            self._draw_region()
+            return
+        self._region = region
+        self._draw_region()
+        self._start_recognition()
+
+    def _on_double_click(self, _event):
+        """Back to the whole page, and back to the size that fits."""
+        self._set_zoom(ZOOM_MIN)
+        if self._region is None or self._busy:
+            # mid-read the box stays: it is what is being read right now
+            return
+        self._region = None
+        self.canvas.delete("region")
+        self._start_recognition()
+
+    def _to_image_box(self, x0, y0, x1, y1):
+        """Canvas coordinates to page pixels, or None if what was drawn is too
+        small to be a selection rather than a stray click."""
+        if self._page_image is None:
+            return None
+        h, w = self._page_image.shape[:2]
+        ox, oy = self._offset
+        sw, sh = self._shown
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        box = [int((left - ox) / sw * w), int((top - oy) / sh * h),
+               int((right - ox) / sw * w), int((bottom - oy) / sh * h)]
+        if box[2] - box[0] < 24 or box[3] - box[1] < 12:
+            return None
+        # A hand-drawn box lands on the writing, not around it, so it is given
+        # a little air: otherwise the tails of "у" and "р" are cut off and the
+        # model has to guess at half a letter.
+        # Kept small on purpose: at 2% of a page-wide box the margin reached
+        # into the line above and read half of it as well.
+        pad = min(12, max(4, int(0.01 * max(box[2] - box[0], box[3] - box[1]))))
+        return (max(0, box[0] - pad), max(0, box[1] - pad),
+                min(w, box[2] + pad), min(h, box[3] + pad))
+
+    def _draw_box(self, x0, y0, x1, y1):
+        self.canvas.delete("region")
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline=skin.SELECT_COLOR,
+                                     width=2, dash=(5, 3), tags="region")
+
+    def _draw_region(self):
+        """Redraw the box from page pixels, so it stays on the same writing
+        when the photo is magnified or moved."""
+        self.canvas.delete("region")
+        if self._region is None or self._page_image is None:
+            return
+        h, w = self._page_image.shape[:2]
+        ox, oy = self._offset
+        sw, sh = self._shown
+        x0, y0, x1, y1 = self._region
+        self._draw_box(ox + x0 / w * sw, oy + y0 / h * sh, ox + x1 / w * sw, oy + y1 / h * sh)
+
+    def _hint_on(self, _event):
+        """Say what a drag over the photo does -- there is no room in the
+        design for a caption, and the gesture is otherwise invisible."""
+        if self._page_image is None or self._busy:
+            return
+        self._hint_under = self.status.get()
+        self.status.set(SELECT_HINT)
+
+    def _hint_off(self, _event):
+        if self.status.get() == SELECT_HINT:      # only if nothing else was said meanwhile
+            self.status.set(getattr(self, "_hint_under", ""))
+
     def _redraw_page(self):
         """Show the page at the current magnification. At 100% it fits the
         panel and sits centred; above that it overflows and scrolls."""
@@ -529,6 +655,7 @@ class HandwritingApp(tk.Tk):
         self.canvas.create_image(ox, oy, anchor="nw", image=self._page_photo, tags="page")
         self.canvas.configure(scrollregion=(0, 0, max(avail_w, new_w), max(avail_h, new_h)))
         self._pin_glass()
+        self._draw_region()
         self._update_zoom_controls()
 
     # -- models ---------------------------------------------------------------
@@ -595,8 +722,49 @@ class HandwritingApp(tk.Tk):
                                  parent=self)
             return
         self._page_image, self._page_name = image, os.path.basename(path)
+        self._region = None
         self._show_page()
         self._start_recognition()
+
+    def _update_mode_label(self):
+        self.ui.itemconfigure(self._mode_item,
+                              text="чтение: целиком" if self.whole_page else "чтение: по строкам")
+
+    def _toggle_mode(self, _event=None):
+        """Switch between reading the page whole and reading it line by line.
+
+        Whole page reads more accurately; line by line colours the lines it
+        doubts and needs a fraction of the memory. The hardware chooses at
+        startup, but neither mode is hidden: on a card too small for the big
+        model it still runs with part of the work on the processor, which is
+        slow enough to be worth saying out loud first.
+        """
+        if self._busy or self.recognizer is None:
+            return
+        want_whole = not self.whole_page
+        if want_whole and not self._slow_whole_page and not page_reader.enough_vram():
+            if not page_reader.can_split():
+                messagebox.showinfo(
+                    "Чтение страницы целиком",
+                    "На этом компьютере такой режим не получится: нужна видеокарта "
+                    "NVIDIA и не меньше 20 ГБ оперативной памяти.\n\n"
+                    "Приложение продолжит читать по строкам — этот режим ещё и "
+                    "подсвечивает строки, в которых сомневается.", parent=self)
+                return
+            if not messagebox.askyesno(
+                    "Чтение страницы целиком",
+                    "Видеокарты для этого режима не хватает, но прочитать можно: "
+                    "модель поместится в оперативную память, а в видеокарту будет "
+                    "подгружаться по частям.\n\n"
+                    "Это медленно: выделенный участок — несколько минут, целая "
+                    "страница — десятки минут, и компьютер всё это время сильно "
+                    "загружен.\n\nВключить такой режим?", parent=self):
+                return
+            self._slow_whole_page = True
+        self.whole_page = want_whole
+        self._update_mode_label()
+        if self._page_image is not None:
+            self._start_recognition()
 
     def on_rotate(self):
         """A quarter turn clockwise, then read again: a phone often saves a
@@ -604,10 +772,12 @@ class HandwritingApp(tk.Tk):
         if self._page_image is None or self._busy:
             return
         self._page_image = cv2.rotate(self._page_image, cv2.ROTATE_90_CLOCKWISE)
+        self._region = None          # its coordinates belong to the old orientation
         self._show_page()
         self._start_recognition()
 
     def _show_page(self):
+        self.canvas.delete("region")
         self._zoom = ZOOM_MIN
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
@@ -619,19 +789,25 @@ class HandwritingApp(tk.Tk):
         self._update_text_zoom_controls()
         self._busy = True
         self._update_buttons()
-        self.status.set(f"{self._page_name}: "
-                        + ("читаю страницу целиком…" if self.whole_page else "ищу строки…"))
-        # The mode is read here, on the main thread, and handed to the worker
-        # with a copy of the page: worker threads must not touch tkinter, nor
-        # a page a rotation could replace while they read it.
+        region = self._region
+        self.status.set(f"{self._page_name}: " + (
+            "читаю выделенный участок…" if region
+            else ("читаю страницу целиком…" if self.whole_page else "ищу строки…")))
+        # The mode and the selection are read here, on the main thread, and
+        # handed to the worker with a copy of what it must read: worker threads
+        # must not touch tkinter, nor a page a rotation could replace under them.
+        image = self._page_image
+        if region:
+            x0, y0, x1, y1 = region
+            image = image[y0:y1, x0:x1]
         threading.Thread(target=self._recognize,
-                         args=(self._page_image.copy(), self._page_name, self.whole_page),
+                         args=(image.copy(), self._page_name, self.whole_page, bool(region)),
                          daemon=True).start()
 
-    def _recognize(self, image, name: str, whole: bool):
+    def _recognize(self, image, name: str, whole: bool, region: bool = False):
         try:
             if whole:
-                lines = self._read_whole_page(image)
+                lines = self._read_whole_page(image, region)
             else:
                 lines = self.recognizer.recognize_page(
                     image, progress=lambda done, total: self._events.put(("progress", (done, total)))
@@ -641,16 +817,18 @@ class HandwritingApp(tk.Tk):
             return
         self._events.put(("recognized", (name, lines)))
 
-    def _read_whole_page(self, image):
+    def _read_whole_page(self, image, region: bool = False):
         """Qwen3-VL reads the page in one pass, so there is no per-line
         confidence to colour by -- every line comes back unmarked."""
         if self.page_reader is None:
             self._events.put(("status", "Загружаю модель чтения страницы "
                                         "(в первый раз качается ~6 ГБ)…"))
-            self.page_reader = page_reader.PageReader()
-        texts = self.page_reader.read_page(
-            image, progress=lambda done, total: self._events.put(("progress", (done, total)))
-        )
+            self.page_reader = page_reader.PageReader(offload=self._slow_whole_page)
+        def progress(done, total):
+            self._events.put(("progress", (done, total)))
+
+        read = self.page_reader.read_region if region else self.page_reader.read_page
+        texts = read(image, progress=progress)
         return [
             RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
             for i, t in enumerate(texts)
@@ -660,7 +838,9 @@ class HandwritingApp(tk.Tk):
         self._events.put(("status", message))
 
     def _update_progress(self, done: int, total: int):
-        if self.whole_page:
+        if self._region:
+            self.status.set(f"{self._page_name}: читаю выделенный участок…")
+        elif self.whole_page:
             self.status.set(f"{self._page_name}: читаю страницу целиком…")
         else:
             self.status.set(f"{self._page_name}: строка {done} из {total}")
@@ -672,6 +852,7 @@ class HandwritingApp(tk.Tk):
             # the rest of this session reads by lines, which needs a fraction
             # of the memory, and this page is read again that way.
             self.whole_page = False
+            self._update_mode_label()
             self.status.set("Не хватило видеопамяти — читаю по строкам")
             self._start_recognition()
             return
@@ -697,12 +878,13 @@ class HandwritingApp(tk.Tk):
         self.ui.itemconfigure(self._text_window, state="normal")
         self._update_text_zoom_controls()
 
+        what = "участок" if self._region else filename
         if self.whole_page:
             tuned = getattr(self.page_reader, "adapter_loaded", False)
             model = "дообученная модель" if tuned else "базовая модель"
-            self.status.set(f"{filename}: строк {len(lines)} ({model})")
+            self.status.set(f"{what}: строк {len(lines)} ({model})")
         else:
-            self.status.set(f"{filename}: строк {len(lines)}, требуют проверки {flagged}")
+            self.status.set(f"{what}: строк {len(lines)}, требуют проверки {flagged}")
         self._update_buttons()
 
     def _current_text(self) -> str:
