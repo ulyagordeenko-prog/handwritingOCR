@@ -41,9 +41,20 @@ bench/
 !scripts/train_qwen.py
 !scripts/hwr200_pages.py
 !scripts/build_ui_assets.py
+!scripts/build_train_manifest.py
+!scripts/eval_adapter.py
+!scripts/bench_enhance.py
+!scripts/fetch_hwr200.py
+!scripts/setup_server.py
+!scripts/remote.py
+!scripts/run_all.sh
+!scripts/pack_results.sh
 
 # данные обучения и скачанные с сервера адаптеры — не часть приложения
 hwr200_pages.jsonl
+hwr200_pages_rest.jsonl
+train_pages.jsonl.gz
+holdout_pages.jsonl
 smoke_pages.jsonl
 hwr200_build*.log
 checkpoints_remote/

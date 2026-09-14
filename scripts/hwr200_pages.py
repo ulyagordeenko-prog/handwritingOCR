@@ -54,17 +54,51 @@ def count_lines(data: bytes, probe_width: int = 900) -> int:
         return 0
 
 
+_SHARED = None
+
+
+def _shared_texts() -> dict:
+    """original<N>.json and fpr<N>.json by file name, wherever they sit.
+
+    Those texts are numbered across the whole set, not per writer: several
+    writers copied out the same text, and its annotation lives in one folder
+    only. Looking under the writer's own folder found it for the first 35
+    writers and silently skipped every other writer's copy -- 40 documents
+    in each later archive, a sixth of the set."""
+    global _SHARED
+    if _SHARED is None:
+        _SHARED = {}
+        for kind in ("Originals", "FPR"):
+            base = os.path.join(ANN_ROOT, kind)
+            for folder in sorted(os.listdir(base)):
+                path = os.path.join(base, folder)
+                if not os.path.isdir(path):
+                    continue
+                for name in os.listdir(path):
+                    if name.endswith(".json"):
+                        _SHARED.setdefault(name, os.path.join(path, name))
+    return _SHARED
+
+
 def load_annotation(writer: str, document: str) -> list[str] | None:
     """The sentences of one document, in order."""
-    for kind in ("Originals", "Reuse", "FPR"):
-        path = os.path.join(ANN_ROOT, kind, writer, f"{document}.json")
-        if os.path.isfile(path):
-            data = json.load(open(path, encoding="utf-8"))
-            sentences = [s["text"].strip() for s in data.get("sentences", []) if s.get("text")]
-            if sentences:
-                return sentences
-            text = (data.get("full_text") or "").strip()
-            return re.split(r"(?<=[.!?])\s+", text) if text else None
+    candidates = [os.path.join(ANN_ROOT, kind, writer, f"{document}.json")
+                  for kind in ("Originals", "Reuse", "FPR")]
+    if f"{document}.json" in _shared_texts():
+        candidates.append(_shared_texts()[f"{document}.json"])
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except ValueError:
+            return None             # a few dozen annotation files are not valid JSON
+        sentences = [s["text"].strip() for s in data.get("sentences", []) if s.get("text")]
+        if sentences:
+            return sentences
+        text = (data.get("full_text") or "").strip()
+        return re.split(r"(?<=[.!?])\s+", text) if text else None
     return None
 
 
