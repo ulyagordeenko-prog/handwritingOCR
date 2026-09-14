@@ -53,6 +53,7 @@ bench/
 # данные обучения и скачанные с сервера адаптеры — не часть приложения
 hwr200_pages.jsonl
 hwr200_pages_rest.jsonl
+hwr200_pages_all.jsonl
 train_pages.jsonl.gz
 holdout_pages.jsonl
 smoke_pages.jsonl
