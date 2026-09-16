@@ -28,6 +28,16 @@ log = logging.getLogger(__name__)
 BASE_MODEL_ID = "raxtemur/trocr-base-ru"
 DEFAULT_ADAPTER = "checkpoints/trocr-lora-v5"
 
+# A single line stuck this long is not read, it is skipped -- much shorter
+# than page_reader.py's whole-page GENERATION_TIMEOUT_S, since one line's
+# beam search normally takes single-digit seconds (see recognize_lines'
+# own docstring: ~113 s for a full page at batch_size=1). Skipping just the
+# stuck line and moving on is only possible here because each line is
+# already its own generate() call in a loop -- the whole-page model reads
+# the entire page as one continuous stream with no such boundary to stop
+# at and resume from, which is why it gets a page-wide timeout instead.
+LINE_TIMEOUT_S = 20.0
+
 
 @dataclass
 class RecognizedLine:
@@ -139,6 +149,7 @@ class Recognizer:
         # its own text, so it can't introduce a word the OCR model didn't
         # already consider plausible from the image.
         num_return = num_beams if self.rescorer else 1
+        started = time.monotonic()
         with torch.no_grad():
             out = self.model.generate(
                 pixel_values,
@@ -152,7 +163,17 @@ class Recognizer:
                 num_return_sequences=num_return,
                 output_scores=True,
                 return_dict_in_generate=True,
+                stopping_criteria=_line_stopping_criteria(started),
             )
+        # A stuck line, not a slow one -- see LINE_TIMEOUT_S. Each line is
+        # its own generate() call already, so unlike the whole-page model
+        # this can just skip it (confidence 0, tinted for a second look) and
+        # let the loop in recognize_lines move on to the next one, rather
+        # than losing the rest of the page the way an unbounded stuck line
+        # otherwise would.
+        stuck = time.monotonic() - started >= LINE_TIMEOUT_S
+        if stuck:
+            log.warning("_recognize_batch: line stuck past %.0fs, skipped", LINE_TIMEOUT_S)
 
         all_texts = [t.strip() for t in self.processor.batch_decode(out.sequences, skip_special_tokens=True)]
         # Per-token probability of each returned sequence. With beam search
@@ -188,6 +209,11 @@ class Recognizer:
             probs = probs[torch.isfinite(probs)]
             if probs.numel() > 0:
                 confidence = float(probs.mean().item())
+            if stuck:
+                # Overrides whatever the truncated beam's own score says --
+                # a forced cut mid-search is not evidence of confidence
+                # either way, and this line needs a second look regardless.
+                confidence = 0.0
 
             results.append((texts[best_k], confidence))
         return results
@@ -255,3 +281,17 @@ class Recognizer:
         if image is None:
             raise ValueError(f"could not read image: {path}")
         return self.recognize_page(image, progress=progress)
+
+
+def _line_stopping_criteria(started: float):
+    """Ends one line's beam search once LINE_TIMEOUT_S has passed since
+    `started` -- see _recognize_batch. Same mechanism as page_reader.py's
+    _stopping_criteria, kept separate rather than shared: that one also
+    watches a cancel_event, this one only ever watches the clock."""
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _Stop(StoppingCriteria):
+        def __call__(self, *_args, **_kwargs) -> bool:
+            return time.monotonic() - started >= LINE_TIMEOUT_S
+
+    return StoppingCriteriaList([_Stop()])

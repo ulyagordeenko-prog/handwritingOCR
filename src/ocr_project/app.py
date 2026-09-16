@@ -911,7 +911,18 @@ class HandwritingApp(tk.Tk):
         cross_check_thread.start()
 
         read = self.page_reader.read_region if region else self.page_reader.read_page
-        texts = read(image, progress=progress, cancel_event=cancel_event)
+        try:
+            texts = read(image, progress=progress, cancel_event=cancel_event)
+        except Exception:
+            # Qwen raising (a stuck read timing out -- see GENERATION_TIMEOUT_S
+            # in page_reader.py) must not leave the cross-check reading on in
+            # the background with nobody waiting on it: signal it to stop at
+            # its own next checkpoint and join before this re-raises. Setting
+            # cancel_event here specifically, not in a plain finally, so a
+            # clean read is never mistaken for one the person cancelled.
+            cancel_event.set()
+            cross_check_thread.join()
+            raise
 
         cross_check_thread.join()
         confidences = self._agreement_scores(texts, trocr_lines, trocr_error)
@@ -962,12 +973,16 @@ class HandwritingApp(tk.Tk):
     def _recognize_failed(self, exc: Exception, whole: bool):
         self._busy = False
         self._cancel_event = None
-        if whole and "out of memory" in str(exc).lower():
-            # There is no switch to flip by hand any more, so the app flips it:
-            # the rest of this session reads by lines, which needs a fraction
-            # of the memory, and this page is read again that way.
+        out_of_memory = "out of memory" in str(exc).lower()
+        # A stuck whole-page read (see GENERATION_TIMEOUT_S in page_reader.py)
+        # is what an out-of-memory crash here usually turns out to be one
+        # StoppingCriteria check away from -- treated the same way: there is
+        # no switch to flip by hand any more, so the app flips it, and this
+        # page is read again by lines, which does not have this failure mode.
+        if whole and (out_of_memory or isinstance(exc, TimeoutError)):
             self.whole_page = False
-            self.status.set("Не хватило видеопамяти — читаю по строкам")
+            self.status.set("Не хватило видеопамяти — читаю по строкам" if out_of_memory
+                            else "Застряла на этой странице — читаю по строкам")
             self._start_recognition()
             return
         self.status.set("Ошибка распознавания")

@@ -70,6 +70,18 @@ PROMPT = (
 # segmentation is not that, and reading a line in isolation strips the context
 # that lets the model settle abbreviations and case. Not kept.
 
+# A page that has not finished in this long is not reading, it is stuck --
+# measured on a real laptop (8 GB card, base model, an ordinary short note):
+# generation ran for 801 s straight without ever reaching an end token, its
+# growing KV cache eventually exceeding the card's memory and crashing with
+# a CUDA out-of-memory error rather than just being slow. The known cause is
+# the same one PROMPT already guards against on the output side (a stretch
+# it cannot read making it loop instead of stopping) -- this bounds the
+# damage on the input side of that same failure, so it is treated the same
+# way an actual out-of-memory crash already is: see _read_one and app.py's
+# _recognize_failed.
+GENERATION_TIMEOUT_S = 120.0
+
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
 
@@ -322,12 +334,12 @@ class PageReader:
             # where the input goes, and accelerate moves it on from there
         ).to(getattr(self.model, "device", "cuda"))
 
-        generate_kwargs = {}
-        if cancel_event is not None:
-            generate_kwargs["stopping_criteria"] = _cancel_stopping_criteria(cancel_event)
-
         prompt_tokens = inputs["input_ids"].shape[1]
         started = time.monotonic()
+        generate_kwargs = {
+            "stopping_criteria": _stopping_criteria(started, GENERATION_TIMEOUT_S, cancel_event),
+        }
+
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
                                       **generate_kwargs)
@@ -342,6 +354,7 @@ class PageReader:
         # Never the handwriting's own content -- see module docstring for
         # what this is for. Lengths and the loop cut, not the letter itself.
         cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        timed_out = elapsed >= GENERATION_TIMEOUT_S
         looped = len(text) - sum(len(l) for l in lines)
         log.info(
             "_read_one: %.1fs, %d/%d new tokens (%.1f tok/s)%s%s%s",
@@ -350,8 +363,18 @@ class PageReader:
             " [hit max_new_tokens -- did not stop on its own]"
                 if new_tokens >= max_new_tokens else "",
             f" [cut {looped} looping chars]" if looped > 0 else "",
-            " [cancelled]" if cancelled else "",
+            " [cancelled]" if cancelled else " [timed out -- stuck]" if timed_out else "",
         )
+        if timed_out and not cancelled:
+            # Not shown as a partial result the way a person's own Cancel is:
+            # this far past what a normal read takes, the growing KV cache is
+            # what turns into the out-of-memory crash logged above -- caught
+            # here instead, before it gets that far. Raising TimeoutError (not
+            # inventing a new type) lets app.py's existing out-of-memory
+            # recovery catch this the same way and fall back to reading line
+            # by line, which does not have this failure mode.
+            raise TimeoutError(
+                f"чтение застряло: {elapsed:.0f} с без остановки, {new_tokens} токенов")
         return lines
 
     def read_region(self, region_bgr, progress=None, cancel_event=None) -> list[str]:
@@ -381,17 +404,24 @@ class PageReader:
         return self.read_page(image, progress=progress, cancel_event=cancel_event)
 
 
-def _cancel_stopping_criteria(cancel_event):
-    """A StoppingCriteria that ends generation early once cancel_event is
-    set, so Cancel in the app interrupts a page mid-sentence rather than
-    only being noticed once the whole (slow) generation call returns.
-    Whatever tokens were generated before the cut are kept -- half a read
-    line by line is still more useful thrown away than kept, the same
-    reasoning trim_runaway already applies to a model stuck in a loop."""
+def _stopping_criteria(started: float, timeout_s: float, cancel_event=None):
+    """A StoppingCriteria that ends generation early on either of two
+    conditions, checked once per generated token rather than only once the
+    whole (slow) generation call returns:
+
+    - cancel_event is set -- a person pressed Cancel. Whatever was
+      generated before the cut is kept as the result: half a page read is
+      still more useful thrown away than kept (see _agreement_scores).
+    - timeout_s has elapsed since `started` -- generation is stuck (see
+      GENERATION_TIMEOUT_S). Always checked, cancel_event or not: this one
+      is not optional the way Cancel is, since left alone it is what turns
+      into an out-of-memory crash rather than just a slow read."""
     from transformers import StoppingCriteria, StoppingCriteriaList
 
-    class _Cancel(StoppingCriteria):
+    class _Stop(StoppingCriteria):
         def __call__(self, *_args, **_kwargs) -> bool:
-            return cancel_event.is_set()
+            if cancel_event is not None and cancel_event.is_set():
+                return True
+            return time.monotonic() - started >= timeout_s
 
-    return StoppingCriteriaList([_Cancel()])
+    return StoppingCriteriaList([_Stop()])
