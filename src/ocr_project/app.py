@@ -27,12 +27,16 @@ coordinates.
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import queue
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
+
+log = logging.getLogger(__name__)
 
 import cv2
 import numpy as np
@@ -781,6 +785,7 @@ class HandwritingApp(tk.Tk):
         page_reader.py and recognizer.py) and returns whatever it had
         already read rather than discarding it."""
         if self._cancel_event is not None:
+            log.info("Cancel pressed")
             self._cancel_event.set()
             self.status.set(f"{self._page_name}: отменяю…")
 
@@ -821,12 +826,15 @@ class HandwritingApp(tk.Tk):
         if region:
             x0, y0, x1, y1 = region
             image = image[y0:y1, x0:x1]
+        log.info("Start: mode=%s region=%s image=%dx%d",
+                 "whole" if self.whole_page else "lines", region, image.shape[1], image.shape[0])
         threading.Thread(target=self._recognize,
                          args=(image.copy(), self._page_name, self.whole_page, bool(region),
                                self._cancel_event),
                          daemon=True).start()
 
     def _recognize(self, image, name: str, whole: bool, region: bool, cancel_event: threading.Event):
+        started = time.monotonic()
         try:
             if whole:
                 lines = self._read_whole_page(image, region, cancel_event)
@@ -836,8 +844,12 @@ class HandwritingApp(tk.Tk):
                     cancel_event=cancel_event,
                 )
         except Exception as exc:
+            log.exception("Read failed after %.1fs", time.monotonic() - started)
             self._events.put(("recognize_failed", (exc, whole)))
             return
+        log.info("Read finished in %.1fs: %d lines%s",
+                 time.monotonic() - started, len(lines),
+                 " [cancelled]" if cancel_event.is_set() else "")
         self._events.put(("recognized", (name, lines, cancel_event.is_set())))
 
     def _read_whole_page(self, image, region: bool, cancel_event: threading.Event):
@@ -999,6 +1011,17 @@ class HandwritingApp(tk.Tk):
 
 
 def main():
+    # Handwriter.exe's launcher redirects stdout/stderr to app.log before
+    # starting this, precisely so a slow or stuck read can be diagnosed from
+    # that file after the fact rather than needing to reproduce it live (see
+    # installer/launcher.py). Run some other way -- a .pyw double-clicked
+    # directly, say -- and stderr can be None, same as stdout already is for
+    # the print below; logging quietly does nothing rather than raising.
+    import sys
+    if sys.stderr is not None:
+        logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
     app = HandwritingApp()
     # Handwriter.exe waits for this line to know the window opened, rather
     # than guessing at how long start-up takes. Under pythonw with no log

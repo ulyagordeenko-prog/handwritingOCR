@@ -8,7 +8,9 @@ places the model was unsure about.
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 
 import cv2
@@ -20,6 +22,8 @@ from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
 from .rescorer import LanguageRescorer
 from .segmentation import segment_lines, split_pages
+
+log = logging.getLogger(__name__)
 
 BASE_MODEL_ID = "raxtemur/trocr-base-ru"
 DEFAULT_ADAPTER = "checkpoints/trocr-lora-v5"
@@ -208,6 +212,7 @@ class Recognizer:
         # (left/right page) instead of one, so segment_lines() below never
         # has to draw a single row projection across both at once -- a
         # single page photo comes back unsplit and this is a no-op.
+        started = time.monotonic()
         segments = []
         for page in split_pages(page_bgr):
             segments.extend(segment_lines(page))
@@ -217,8 +222,10 @@ class Recognizer:
             progress(0, total)
 
         results = []
+        cancelled = False
         for start in range(0, total, batch_size):
             if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
                 break
             chunk = segments[start:start + batch_size]
             recognized = self.recognize_lines([crop for _, crop in chunk], num_beams=num_beams,
@@ -232,6 +239,11 @@ class Recognizer:
                 )
             if progress:
                 progress(len(results), total)
+        # Not the handwriting's own text here either -- see page_reader.py's
+        # module docstring for why: lengths and confidence only.
+        log.info("recognize_page: %.1fs, %d/%d lines, num_beams=%d%s",
+                 time.monotonic() - started, len(results), total, num_beams,
+                 " [cancelled]" if cancelled else "")
         return results
 
     def recognize_file(self, path: str, progress=None) -> list[RecognizedLine]:

@@ -11,16 +11,27 @@ error on a notebook page, against 6.9% for our fine-tuned line model.
 
 The weights are ~17 GB in full precision, so they are loaded quantized to
 4 bits (about 5-6 GB) to fit an 8 GB laptop card.
+
+Logs timing and token counts for each generation (module logger, picked up
+by the installed app's app.log -- see installer/launcher.py) so a slow or
+stuck read can be diagnosed from that file alone. Never the handwriting's
+own text: it is someone else's letter, diary page, or similar, and a debug
+log is not the place for it -- only lengths and whether trim_runaway had
+to cut a loop out of it.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 
 import torch
 from PIL import Image
 
 from .segmentation import crop_to_page, deskew, split_pages
+
+log = logging.getLogger(__name__)
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -243,6 +254,7 @@ class PageReader:
                     bnb_4bit_quant_type="nf4",
                 )
 
+        started = time.monotonic()
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
@@ -253,6 +265,10 @@ class PageReader:
             self.model = PeftModel.from_pretrained(self.model, adapter_dir)
             self.model.eval()
             self.adapter_loaded = True
+
+        log.info("PageReader loaded in %.1fs: offload=%s quantize=%s adapter=%s (%s)",
+                 time.monotonic() - started, offload, quantize, self.adapter_loaded,
+                 adapter_dir if self.adapter_loaded else "none")
 
     def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None,
                   cancel_event=None) -> list[str]:
@@ -310,14 +326,33 @@ class PageReader:
         if cancel_event is not None:
             generate_kwargs["stopping_criteria"] = _cancel_stopping_criteria(cancel_event)
 
+        prompt_tokens = inputs["input_ids"].shape[1]
+        started = time.monotonic()
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
                                       **generate_kwargs)
+        elapsed = time.monotonic() - started
+        new_tokens = out.shape[1] - prompt_tokens
 
         text = self.processor.batch_decode(
-            out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            out[:, prompt_tokens:], skip_special_tokens=True
         )[0].strip()
-        return trim_runaway([line for line in text.splitlines() if line.strip()])
+        lines = trim_runaway([line for line in text.splitlines() if line.strip()])
+
+        # Never the handwriting's own content -- see module docstring for
+        # what this is for. Lengths and the loop cut, not the letter itself.
+        cancelled = bool(cancel_event is not None and cancel_event.is_set())
+        looped = len(text) - sum(len(l) for l in lines)
+        log.info(
+            "_read_one: %.1fs, %d/%d new tokens (%.1f tok/s)%s%s%s",
+            elapsed, new_tokens, max_new_tokens,
+            new_tokens / elapsed if elapsed > 0 else 0.0,
+            " [hit max_new_tokens -- did not stop on its own]"
+                if new_tokens >= max_new_tokens else "",
+            f" [cut {looped} looping chars]" if looped > 0 else "",
+            " [cancelled]" if cancelled else "",
+        )
+        return lines
 
     def read_region(self, region_bgr, progress=None, cancel_event=None) -> list[str]:
         """Read exactly the piece someone drew a box around.
