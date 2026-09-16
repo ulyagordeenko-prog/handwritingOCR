@@ -30,8 +30,8 @@ TITLE_BAR = (0, 0, 1280, 40)
 # the placeholder note sat between the logo and the window controls
 STATUS_CENTER = (712, 20)
 STATUS_MAX_WIDTH = 800
-MINIMIZE_HIT = (1134, 4, 52, 32)
-CLOSE_HIT = (1214, 3, 40, 34)
+MINIMIZE_HIT = (1104, 5, 49, 29)
+CLOSE_HIT = (1199, 5, 49, 29)
 
 # toolbar: (x, y, w, h) of each pill as drawn, and its corner radius --------
 BUTTON_RADIUS = 15

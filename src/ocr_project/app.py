@@ -340,8 +340,13 @@ class HandwritingApp(tk.Tk):
         self.ui.tag_bind(self._status_item, "<Double-Button-1>", self._open_log)
         self.status.trace_add("write", lambda *_: self._render_status())
 
-        SkinButton(self, skin.MINIMIZE_HIT, self._minimize, radius=8)
-        SkinButton(self, skin.CLOSE_HIT, self.destroy, radius=8)
+        # A full capsule -- radius half the pill's own height -- rather than a
+        # small corner rounding: that is the actual shape baked into the
+        # background (see skin.MINIMIZE_HIT/CLOSE_HIT), and the hover/press
+        # mask has to match it or a square corner shows outside the oval.
+        capsule = skin.MINIMIZE_HIT[3] / 2
+        SkinButton(self, skin.MINIMIZE_HIT, self._minimize, radius=capsule)
+        SkinButton(self, skin.CLOSE_HIT, self.destroy, radius=capsule)
 
         self.buttons = {
             "open": SkinButton(self, skin.BUTTONS["open"], self.on_open),
