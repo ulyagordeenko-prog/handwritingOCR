@@ -333,6 +333,11 @@ class HandwritingApp(tk.Tk):
                                                 fill=skin.STATUS_COLOR, font=self._status_font)
         self.ui.tag_bind(self._status_item, "<ButtonPress-1>", self._drag_start)
         self.ui.tag_bind(self._status_item, "<B1-Motion>", self._drag_move)
+        # A double-click is not a drag gesture, so it is free for this: there
+        # is no button to spare for it in the design (see skin.py's docstring
+        # on where buttons come from), and the status line is what actually
+        # changes while a read is stuck, so it is the natural place to look.
+        self.ui.tag_bind(self._status_item, "<Double-Button-1>", self._open_log)
         self.status.trace_add("write", lambda *_: self._render_status())
 
         SkinButton(self, skin.MINIMIZE_HIT, self._minimize, radius=8)
@@ -487,6 +492,22 @@ class HandwritingApp(tk.Tk):
                 text = text[:-1]
             text += "…"
         self.ui.itemconfigure(self._status_item, text=text)
+
+    def _open_log(self, _event=None):
+        """Open app.log where the installed app's launcher writes it (see
+        installer/launcher.py) -- same env override, same default, so this
+        finds the real one rather than a guess that drifts from it."""
+        home = os.environ.get("HANDWRITER_HOME") or os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Handwriter")
+        log_path = os.path.join(home, "app.log")
+        if not os.path.isfile(log_path):
+            messagebox.showinfo("Журнал", f"Файла ещё нет: {log_path}\n\n"
+                                "Он появляется после первого чтения страницы.", parent=self)
+            return
+        try:
+            os.startfile(log_path)  # Windows only, same as the rest of the app
+        except OSError as exc:
+            messagebox.showerror("Не открылось", f"{log_path}\n\n{exc}", parent=self)
 
     def _update_buttons(self):
         ready = self.recognizer is not None and not self._busy
