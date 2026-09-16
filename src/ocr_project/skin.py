@@ -37,9 +37,11 @@ CLOSE_HIT = (1214, 3, 40, 34)
 BUTTON_RADIUS = 15
 BUTTONS = {
     "open":   (28.5, 55, 150, 45),
-    "save":   (203.5, 55, 150, 45),
-    "copy":   (378.5, 55, 150, 45),
-    "rotate": (553.5, 55, 56, 45),
+    "start":  (373.5, 55, 100, 45),
+    "cancel": (498.5, 55, 100, 45),
+    "save":   (648.5, 55, 150, 45),
+    "copy":   (823.5, 55, 150, 45),
+    "rotate": (1192.5, 55, 56, 45),
 }
 
 # The photo and text panels are built alike: a 570 x 570 glass panel, a
@@ -83,10 +85,6 @@ TEXT_ZOOM_OUT_HIT = (738.5, 721, 24, 24)
 TEXT_ZOOM_LABEL_CENTER = (707.15, 732.5)
 # the "100 %" figures are drawn ~13 px tall in the design
 ZOOM_FONT_PX = 19
-
-# The reading-mode switch, on the empty stretch of the bottom bar and ending
-# level with the right edge of the photo panel (anchor "e").
-READ_MODE_RIGHT = (597, 732.5)
 
 TEXT_COLOR = "#1c1c1c"
 STATUS_COLOR = "#141414"

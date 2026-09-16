@@ -188,9 +188,21 @@ class Recognizer:
             results.append((texts[best_k], confidence))
         return results
 
-    def recognize_page(self, page_bgr: np.ndarray, progress=None, batch_size: int = 1) -> list[RecognizedLine]:
+    def recognize_page(self, page_bgr: np.ndarray, progress=None, batch_size: int = 1,
+                        num_beams: int = 5, cancel_event=None) -> list[RecognizedLine]:
         """progress(done, total) is called as batches complete, so the GUI can
-        show movement instead of freezing for the whole page."""
+        show movement instead of freezing for the whole page.
+
+        num_beams is exposed (rather than fixed at recognize_lines' own
+        default) for callers that want a cheaper, rougher pass -- the
+        whole-page cross-check in app.py only needs an approximate second
+        opinion to fuzzy-match against, not this model's best possible
+        reading, and beam search is the slow part of it.
+
+        cancel_event, if given, is checked once per batch: each line's own
+        beam search is short enough that stopping between batches, rather
+        than needing a StoppingCriteria mid-line the way the much slower
+        whole-page model does, is already responsive."""
         # A book/notebook spread photo has two independently-flowing text
         # columns; split_pages() detects that and hands back two images
         # (left/right page) instead of one, so segment_lines() below never
@@ -206,8 +218,11 @@ class Recognizer:
 
         results = []
         for start in range(0, total, batch_size):
+            if cancel_event is not None and cancel_event.is_set():
+                break
             chunk = segments[start:start + batch_size]
-            recognized = self.recognize_lines([crop for _, crop in chunk], batch_size=batch_size)
+            recognized = self.recognize_lines([crop for _, crop in chunk], num_beams=num_beams,
+                                              batch_size=batch_size)
             for offset, ((bbox, crop), (text, confidence)) in enumerate(zip(chunk, recognized)):
                 results.append(
                     RecognizedLine(

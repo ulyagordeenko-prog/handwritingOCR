@@ -8,6 +8,16 @@ reads the whole photo in one pass -- more accurate, but it needs a card
 with about 8 GB, so the app uses it only where one is present. Text is
 editable, so fixing a mistake and exporting a clean transcript is one flow.
 
+Whole-page reading has no per-token confidence of its own, and its failure
+mode is worse than just being unsure: on a stretch it cannot actually read
+it can write a fluent, invented sentence that looks exactly like a correct
+one. So every whole-page read is silently cross-checked against the line
+recognizer's own independent reading of the same image, run alongside it
+rather than after so the smaller model's pass costs little beyond what it
+already spends idle, and a line with no trace in that second reading is
+tinted the same way a low-confidence line already is -- see
+_read_whole_page and _agreement_scores.
+
 The window is the Figma design (design/window.svg and design/content.svg):
 its frosted background, glass panels, button faces and legend are
 pre-rendered images (see skin.py), and the live parts -- photo, text, status,
@@ -27,13 +37,32 @@ from tkinter import filedialog, messagebox
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
+from rapidfuzz import fuzz
 
 from . import page_reader, skin
 from .recognizer import RecognizedLine, Recognizer
 
-# Confidence below this is treated as "look at this one".
+# Confidence below this is treated as "look at this one". Calibrated against
+# the line-by-line recognizer's own per-token probability.
 LOW_CONFIDENCE = 0.80
 MEDIUM_CONFIDENCE = 0.90
+
+# Whole-page reading has no per-token probability of its own, so its lines
+# are instead scored by how much of each turns up in an independent second
+# reading (see _cross_check_confidence). That score lives on a different
+# scale -- even a correctly-read line often only partially matches the
+# line-by-line pass's own noisy transcription -- so it needs its own, lower
+# thresholds rather than reusing LOW_CONFIDENCE/MEDIUM_CONFIDENCE.
+#
+# Sanity-checked (not a real-photo calibration) with rapidfuzz directly:
+# two independently noisy readings of the same real sentence still matched
+# at 85-93%, while lines invented outright by the untuned model on
+# real held-out pages (server_results/run2/extracted/bench/compare_texts.txt)
+# matched their page's actual content at only ~40%. These thresholds sit in
+# the gap between those two clusters; still worth revisiting once there is
+# real usage on real photos to calibrate against.
+WHOLE_PAGE_LOW = 0.45
+WHOLE_PAGE_MEDIUM = 0.65
 
 ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 1.0, 8.0, 1.25
 SELECT_HINT = "Обведите участок мышью — прочитаю только его"
@@ -196,6 +225,9 @@ class HandwritingApp(tk.Tk):
         # set once the person has agreed to whole-page reading on a card too
         # small for it, which puts part of the model on the processor
         self._slow_whole_page = False
+        # set fresh for each read, so Cancel always reaches the read that is
+        # actually running rather than a stale one from before
+        self._cancel_event: threading.Event | None = None
 
         # Worker threads must not touch tkinter (not even via .after());
         # they post messages here and the main thread drains the queue.
@@ -304,6 +336,8 @@ class HandwritingApp(tk.Tk):
 
         self.buttons = {
             "open": SkinButton(self, skin.BUTTONS["open"], self.on_open),
+            "start": SkinButton(self, skin.BUTTONS["start"], self.on_start),
+            "cancel": SkinButton(self, skin.BUTTONS["cancel"], self.on_cancel),
             "save": SkinButton(self, skin.BUTTONS["save"], self.on_save),
             "copy": SkinButton(self, skin.BUTTONS["copy"], self.on_copy),
             "rotate": SkinButton(self, skin.BUTTONS["rotate"], self.on_rotate),
@@ -336,19 +370,6 @@ class HandwritingApp(tk.Tk):
         zx, zy = skin.ZOOM_LABEL_CENTER
         self._zoom_item = self.ui.create_text(zx * s, zy * s, text="100 %", anchor="center",
                                               fill=skin.TEXT_COLOR, font=self._zoom_font)
-
-        # Which way the page is read, on the empty stretch of the bottom bar.
-        # The hardware picks the first mode, but both are offered everywhere:
-        # whole-page reads more accurately, line-by-line marks the lines it
-        # doubts, and only the person reading knows which they need now.
-        mx, my = skin.READ_MODE_RIGHT
-        self._mode_item = self.ui.create_text(mx * s, my * s, text="", anchor="e",
-                                              fill=skin.TEXT_COLOR, font=self._zoom_font)
-        self.ui.tag_bind(self._mode_item, "<Button-1>", self._toggle_mode)
-        self.ui.tag_bind(self._mode_item, "<Enter>",
-                         lambda e: self.ui.configure(cursor="hand2"))
-        self.ui.tag_bind(self._mode_item, "<Leave>", lambda e: self.ui.configure(cursor=""))
-        self._update_mode_label()
 
         self._page_photo = None
         self._zoom = ZOOM_MIN            # 1.0 = the whole page fits the panel
@@ -467,11 +488,11 @@ class HandwritingApp(tk.Tk):
         ready = self.recognizer is not None and not self._busy
         has_text = bool(self._current_text()) and not self._busy
         self.buttons["open"].set_enabled(ready)
+        self.buttons["start"].set_enabled(ready and self._page_image is not None)
+        self.buttons["cancel"].set_enabled(self._busy)
         self.buttons["save"].set_enabled(has_text)
         self.buttons["copy"].set_enabled(has_text)
         self.buttons["rotate"].set_enabled(ready and self._page_image is not None)
-        # the mode switch greys out while a page is being read
-        self.ui.itemconfigure(self._mode_item, fill=skin.TEXT_COLOR if ready else "#8a8a8a")
 
     # -- photo view -----------------------------------------------------------
 
@@ -690,9 +711,26 @@ class HandwritingApp(tk.Tk):
 
     def _model_ready(self, recognizer: Recognizer):
         self.recognizer = recognizer
+        # Whole-page and line-by-line are no longer a choice offered on every
+        # read -- every read uses both models together where the hardware
+        # allows it (see _read_whole_page). What used to be asked at the
+        # moment someone tried to switch modes by hand is asked once here
+        # instead, since a card too small for whole-page reading natively can
+        # still manage it slowly with part of the model on the processor.
+        if not self.whole_page and page_reader.can_split():
+            if messagebox.askyesno(
+                    "Чтение страницы целиком",
+                    "Видеокарты для чтения страницы целиком не хватает, но прочитать "
+                    "можно: модель поместится в оперативную память, а в видеокарту "
+                    "будет подгружаться по частям.\n\n"
+                    "Это медленно: выделенный участок — несколько минут, целая "
+                    "страница — десятки минут, и компьютер всё это время сильно "
+                    "загружен.\n\nВключить такой режим?", parent=self):
+                self._slow_whole_page = True
+                self.whole_page = True
+
         where = "GPU" if recognizer.device == "cuda" else "CPU"
-        mode = "страница целиком" if self.whole_page else "по строкам"
-        self.status.set(f"Готово ({mode}, {where}). Откройте фото страницы.")
+        self.status.set(f"Готово ({where}). Откройте фото страницы.")
         self._update_buttons()
 
         # Explain the fall back to CPU once, up front -- otherwise the only
@@ -724,47 +762,27 @@ class HandwritingApp(tk.Tk):
         self._page_image, self._page_name = image, os.path.basename(path)
         self._region = None
         self._show_page()
+        self.status.set(f"{self._page_name}: открыто — нажмите «Start», чтобы прочитать")
+        self._update_buttons()
+
+    def on_start(self):
+        """Begin (or repeat) reading the page currently shown -- opening a
+        photo no longer reads it right away, so there is a moment between
+        the two where the person can look at what was opened, switch mode,
+        or draw a region, before committing to it."""
+        if self._page_image is None or self._busy or self.recognizer is None:
+            return
         self._start_recognition()
 
-    def _update_mode_label(self):
-        self.ui.itemconfigure(self._mode_item,
-                              text="чтение: целиком" if self.whole_page else "чтение: по строкам")
-
-    def _toggle_mode(self, _event=None):
-        """Switch between reading the page whole and reading it line by line.
-
-        Whole page reads more accurately; line by line colours the lines it
-        doubts and needs a fraction of the memory. The hardware chooses at
-        startup, but neither mode is hidden: on a card too small for the big
-        model it still runs with part of the work on the processor, which is
-        slow enough to be worth saying out loud first.
-        """
-        if self._busy or self.recognizer is None:
-            return
-        want_whole = not self.whole_page
-        if want_whole and not self._slow_whole_page and not page_reader.enough_vram():
-            if not page_reader.can_split():
-                messagebox.showinfo(
-                    "Чтение страницы целиком",
-                    "На этом компьютере такой режим не получится: нужна видеокарта "
-                    "NVIDIA и не меньше 20 ГБ оперативной памяти.\n\n"
-                    "Приложение продолжит читать по строкам — этот режим ещё и "
-                    "подсвечивает строки, в которых сомневается.", parent=self)
-                return
-            if not messagebox.askyesno(
-                    "Чтение страницы целиком",
-                    "Видеокарты для этого режима не хватает, но прочитать можно: "
-                    "модель поместится в оперативную память, а в видеокарту будет "
-                    "подгружаться по частям.\n\n"
-                    "Это медленно: выделенный участок — несколько минут, целая "
-                    "страница — десятки минут, и компьютер всё это время сильно "
-                    "загружен.\n\nВключить такой режим?", parent=self):
-                return
-            self._slow_whole_page = True
-        self.whole_page = want_whole
-        self._update_mode_label()
-        if self._page_image is not None:
-            self._start_recognition()
+    def on_cancel(self):
+        """Ask the read in progress to stop. Cooperative, not immediate: the
+        worker notices at its next checkpoint (between spread pages, inside
+        generation via a StoppingCriteria, or between line batches -- see
+        page_reader.py and recognizer.py) and returns whatever it had
+        already read rather than discarding it."""
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+            self.status.set(f"{self._page_name}: отменяю…")
 
     def on_rotate(self):
         """A quarter turn clockwise, then read again: a phone often saves a
@@ -788,6 +806,9 @@ class HandwritingApp(tk.Tk):
         self.ui.itemconfigure(self._text_window, state="hidden")
         self._update_text_zoom_controls()
         self._busy = True
+        # Fresh each time: an event Cancel already set on a previous read
+        # must not carry over and stop the next one before it starts.
+        self._cancel_event = threading.Event()
         self._update_buttons()
         region = self._region
         self.status.set(f"{self._page_name}: " + (
@@ -801,25 +822,35 @@ class HandwritingApp(tk.Tk):
             x0, y0, x1, y1 = region
             image = image[y0:y1, x0:x1]
         threading.Thread(target=self._recognize,
-                         args=(image.copy(), self._page_name, self.whole_page, bool(region)),
+                         args=(image.copy(), self._page_name, self.whole_page, bool(region),
+                               self._cancel_event),
                          daemon=True).start()
 
-    def _recognize(self, image, name: str, whole: bool, region: bool = False):
+    def _recognize(self, image, name: str, whole: bool, region: bool, cancel_event: threading.Event):
         try:
             if whole:
-                lines = self._read_whole_page(image, region)
+                lines = self._read_whole_page(image, region, cancel_event)
             else:
                 lines = self.recognizer.recognize_page(
-                    image, progress=lambda done, total: self._events.put(("progress", (done, total)))
+                    image, progress=lambda done, total: self._events.put(("progress", (done, total))),
+                    cancel_event=cancel_event,
                 )
         except Exception as exc:
             self._events.put(("recognize_failed", (exc, whole)))
             return
-        self._events.put(("recognized", (name, lines)))
+        self._events.put(("recognized", (name, lines, cancel_event.is_set())))
 
-    def _read_whole_page(self, image, region: bool = False):
-        """Qwen3-VL reads the page in one pass, so there is no per-line
-        confidence to colour by -- every line comes back unmarked."""
+    def _read_whole_page(self, image, region: bool, cancel_event: threading.Event):
+        """Qwen3-VL reads the page in one pass. It has no per-token
+        probability of its own to colour lines by, and worse, the one place
+        it fails is not by looking unsure -- on a stretch it cannot actually
+        read it can write a fluent, plausible, entirely invented sentence
+        instead, which looks exactly like a correct one. So each line is
+        checked against a second, independent reading, run at the same time
+        rather than after -- the two models are already both resident
+        regardless of mode (see _load_model), and Qwen's own generation is
+        the long pole here, so a much smaller model reading alongside it
+        costs little beyond what was already being spent standing idle."""
         if self.page_reader is None:
             self._events.put(("status", "Загружаю модель чтения страницы "
                                         "(в первый раз качается ~6 ГБ)…"))
@@ -827,12 +858,62 @@ class HandwritingApp(tk.Tk):
         def progress(done, total):
             self._events.put(("progress", (done, total)))
 
+        # Started before Qwen so the two overlap for the whole read rather
+        # than TrOCR only picking up whatever's left once Qwen returns. Its
+        # own progress is not wired to the status line: whole-page mode
+        # already shows one fixed message for the whole read (see
+        # _update_progress), so a second source of "progress" events here
+        # would only make that line flicker, not say anything truer.
+        trocr_lines: list[RecognizedLine] = []
+        trocr_error: list[Exception] = []
+
+        def run_cross_check():
+            try:
+                trocr_lines.extend(self.recognizer.recognize_page(
+                    image, num_beams=2, cancel_event=cancel_event))
+            except Exception as exc:      # collected, not raised: see _agreement_scores
+                trocr_error.append(exc)
+
+        cross_check_thread = threading.Thread(target=run_cross_check, daemon=True)
+        cross_check_thread.start()
+
         read = self.page_reader.read_region if region else self.page_reader.read_page
-        texts = read(image, progress=progress)
+        texts = read(image, progress=progress, cancel_event=cancel_event)
+
+        cross_check_thread.join()
+        confidences = self._agreement_scores(texts, trocr_lines, trocr_error)
         return [
-            RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=1.0, image=None)
-            for i, t in enumerate(texts)
+            RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=c, image=None)
+            for i, (t, c) in enumerate(zip(texts, confidences))
         ]
+
+    def _agreement_scores(self, lines: list[str], trocr_lines: list[RecognizedLine],
+                           trocr_error: list[Exception]) -> list[float]:
+        """How much of each of Qwen's lines actually turns up in the
+        line-by-line recognizer's own, independent reading of the same
+        image, run concurrently with Qwen's own (see _read_whole_page).
+
+        The two engines fail in different ways -- the line-by-line model
+        garbles a hard word or leaves a line blank, it does not compose a
+        fluent unrelated sentence -- so agreement between them is real
+        evidence a line is actually on the page, and a line with no trace
+        in the second reading is the signature of invention. Scored with a
+        fuzzy partial match rather than an exact one, since the two engines
+        rarely produce identical text even when both are basically right --
+        segmentation differs and mistakes differ.
+
+        Fails open (1.0, i.e. trusted, for every line) if the second
+        reading itself raised (passed in via trocr_error, since it ran on
+        another thread): a broken cross-check must not block the primary
+        result the person actually asked for."""
+        if not lines:
+            return []
+        if trocr_error:
+            return [1.0] * len(lines)
+        reference = "\n".join(l.text for l in trocr_lines).strip()
+        if not reference:
+            return [1.0] * len(lines)
+        return [fuzz.partial_ratio(line, reference) / 100 for line in lines]
 
     def status_from_worker(self, message: str):
         self._events.put(("status", message))
@@ -847,12 +928,12 @@ class HandwritingApp(tk.Tk):
 
     def _recognize_failed(self, exc: Exception, whole: bool):
         self._busy = False
+        self._cancel_event = None
         if whole and "out of memory" in str(exc).lower():
             # There is no switch to flip by hand any more, so the app flips it:
             # the rest of this session reads by lines, which needs a fraction
             # of the memory, and this page is read again that way.
             self.whole_page = False
-            self._update_mode_label()
             self.status.set("Не хватило видеопамяти — читаю по строкам")
             self._start_recognition()
             return
@@ -860,31 +941,40 @@ class HandwritingApp(tk.Tk):
         self._update_buttons()
         messagebox.showerror("Ошибка распознавания", str(exc), parent=self)
 
-    def _show_results(self, filename: str, lines):
+    def _show_results(self, filename: str, lines, cancelled: bool = False):
         self._busy = False
+        self._cancel_event = None
         if not lines:
-            self.status.set(f"{filename}: строки не найдены")
+            self.status.set(f"{filename}: отменено" if cancelled else f"{filename}: строки не найдены")
             self._update_buttons()
             return
 
-        flagged = sum(1 for line in lines if line.confidence < MEDIUM_CONFIDENCE)
+        # Whole-page confidence comes from cross-checking against a second,
+        # independent reading (see _cross_check_confidence) rather than a
+        # per-token probability, and sits on a different, lower scale even
+        # for a genuinely correct line -- so it is flagged against its own
+        # thresholds, not the line-by-line model's.
+        low, medium = (WHOLE_PAGE_LOW, WHOLE_PAGE_MEDIUM) if self.whole_page \
+            else (LOW_CONFIDENCE, MEDIUM_CONFIDENCE)
+        flagged = sum(1 for line in lines if line.confidence < medium)
         self.text.delete("1.0", tk.END)
         for i, line in enumerate(lines, start=1):
             self.text.insert(tk.END, line.text + "\n")
-            if line.confidence < LOW_CONFIDENCE:
+            if line.confidence < low:
                 self.text.tag_add("low", f"{i}.0", f"{i}.end")
-            elif line.confidence < MEDIUM_CONFIDENCE:
+            elif line.confidence < medium:
                 self.text.tag_add("medium", f"{i}.0", f"{i}.end")
         self.ui.itemconfigure(self._text_window, state="normal")
         self._update_text_zoom_controls()
 
         what = "участок" if self._region else filename
+        prefix = "отменено, " if cancelled else ""
         if self.whole_page:
             tuned = getattr(self.page_reader, "adapter_loaded", False)
             model = "дообученная модель" if tuned else "базовая модель"
-            self.status.set(f"{what}: строк {len(lines)} ({model})")
+            self.status.set(f"{what}: {prefix}строк {len(lines)} ({model}), требуют проверки {flagged}")
         else:
-            self.status.set(f"{what}: строк {len(lines)}, требуют проверки {flagged}")
+            self.status.set(f"{what}: {prefix}строк {len(lines)}, требуют проверки {flagged}")
         self._update_buttons()
 
     def _current_text(self) -> str:

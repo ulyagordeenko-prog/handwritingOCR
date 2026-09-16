@@ -254,7 +254,8 @@ class PageReader:
             self.model.eval()
             self.adapter_loaded = True
 
-    def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None) -> list[str]:
+    def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None,
+                  cancel_event=None) -> list[str]:
         """Read a photographed page.
 
         The photo is cropped to the sheet, straightened, and separated into
@@ -268,6 +269,12 @@ class PageReader:
         measured pages that bought nothing: 16.1% character error against
         15.9% for plain whole pages. It cost three generations per page and
         four bugs, so it is gone rather than left as an unused switch.
+
+        cancel_event, if given, is checked between pieces and mid-generation
+        (see _read_one): a spread already stops after whichever half is in
+        flight, rather than starting the other one, and a single page stops
+        wherever generation had got to, keeping what it had already written
+        rather than discarding it.
         """
         page_bgr, _ = crop_to_page(page_bgr)
         page_bgr, _ = deskew(page_bgr)
@@ -275,14 +282,16 @@ class PageReader:
 
         lines: list[str] = []
         for i, piece in enumerate(pieces):
+            if cancel_event is not None and cancel_event.is_set():
+                break
             if progress:
                 progress(i, len(pieces))
-            lines.extend(self._read_one(piece, max_new_tokens))
+            lines.extend(self._read_one(piece, max_new_tokens, cancel_event))
         if progress:
             progress(len(pieces), len(pieces))
         return lines
 
-    def _read_one(self, page_bgr, max_new_tokens: int = 1024) -> list[str]:
+    def _read_one(self, page_bgr, max_new_tokens: int = 1024, cancel_event=None) -> list[str]:
         import cv2
 
         image = Image.fromarray(cv2.cvtColor(page_bgr, cv2.COLOR_BGR2RGB))
@@ -297,15 +306,20 @@ class PageReader:
             # where the input goes, and accelerate moves it on from there
         ).to(getattr(self.model, "device", "cuda"))
 
+        generate_kwargs = {}
+        if cancel_event is not None:
+            generate_kwargs["stopping_criteria"] = _cancel_stopping_criteria(cancel_event)
+
         with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                                      **generate_kwargs)
 
         text = self.processor.batch_decode(
             out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )[0].strip()
         return trim_runaway([line for line in text.splitlines() if line.strip()])
 
-    def read_region(self, region_bgr, progress=None) -> list[str]:
+    def read_region(self, region_bgr, progress=None, cancel_event=None) -> list[str]:
         """Read exactly the piece someone drew a box around.
 
         None of read_page's preparation happens here. Cropping and
@@ -316,12 +330,12 @@ class PageReader:
         """
         if progress:
             progress(0, 1)
-        lines = self._read_one(region_bgr)
+        lines = self._read_one(region_bgr, cancel_event=cancel_event)
         if progress:
             progress(1, 1)
         return lines
 
-    def read_file(self, path: str, progress=None) -> list[str]:
+    def read_file(self, path: str, progress=None, cancel_event=None) -> list[str]:
         import cv2
         import numpy as np
 
@@ -329,4 +343,20 @@ class PageReader:
         image = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"не удалось прочитать изображение: {path}")
-        return self.read_page(image, progress=progress)
+        return self.read_page(image, progress=progress, cancel_event=cancel_event)
+
+
+def _cancel_stopping_criteria(cancel_event):
+    """A StoppingCriteria that ends generation early once cancel_event is
+    set, so Cancel in the app interrupts a page mid-sentence rather than
+    only being noticed once the whole (slow) generation call returns.
+    Whatever tokens were generated before the cut are kept -- half a read
+    line by line is still more useful thrown away than kept, the same
+    reasoning trim_runaway already applies to a model stuck in a loop."""
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _Cancel(StoppingCriteria):
+        def __call__(self, *_args, **_kwargs) -> bool:
+            return cancel_event.is_set()
+
+    return StoppingCriteriaList([_Cancel()])
