@@ -219,9 +219,15 @@ class Recognizer:
         return results
 
     def recognize_page(self, page_bgr: np.ndarray, progress=None, batch_size: int = 1,
-                        num_beams: int = 5, cancel_event=None) -> list[RecognizedLine]:
+                        num_beams: int = 5, cancel_event=None, on_line=None) -> list[RecognizedLine]:
         """progress(done, total) is called as batches complete, so the GUI can
         show movement instead of freezing for the whole page.
+
+        on_line(RecognizedLine), if given, is called for each line right as
+        it is recognized -- unlike the whole-page model, every line is
+        already its own step in this loop, so there is no need to stream
+        partial output mid-generation the way _generate_streamed does for
+        that one; the line itself, done or not, is the natural unit here.
 
         num_beams is exposed (rather than fixed at recognize_lines' own
         default) for callers that want a cheaper, rougher pass -- the
@@ -257,12 +263,13 @@ class Recognizer:
             recognized = self.recognize_lines([crop for _, crop in chunk], num_beams=num_beams,
                                               batch_size=batch_size)
             for offset, ((bbox, crop), (text, confidence)) in enumerate(zip(chunk, recognized)):
-                results.append(
-                    RecognizedLine(
-                        index=start + offset, bbox=bbox, text=text,
-                        confidence=confidence, image=crop,
-                    )
+                line = RecognizedLine(
+                    index=start + offset, bbox=bbox, text=text,
+                    confidence=confidence, image=crop,
                 )
+                results.append(line)
+                if on_line:
+                    on_line(line)
             if progress:
                 progress(len(results), total)
         # Not the handwriting's own text here either -- see page_reader.py's

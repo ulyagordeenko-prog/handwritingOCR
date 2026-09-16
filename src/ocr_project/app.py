@@ -722,6 +722,10 @@ class HandwritingApp(tk.Tk):
                     self.status.set(payload)
                 elif kind == "progress":
                     self._update_progress(*payload)
+                elif kind == "partial_text":
+                    self._show_partial_text(*payload)
+                elif kind == "partial_line":
+                    self._append_partial_line(payload)
         except queue.Empty:
             pass
         self.after(50, self._drain_events)
@@ -835,6 +839,11 @@ class HandwritingApp(tk.Tk):
         # Fresh each time: an event Cancel already set on a previous read
         # must not carry over and stop the next one before it starts.
         self._cancel_event = threading.Event()
+        # Counts lines already shown by _append_partial_line, so its tags
+        # land on the same "N.0"/"N.end" indices _show_results itself would
+        # use -- the two must agree, since the final render overwrites this
+        # one but a person may already be reading a line by the time it does.
+        self._partial_line_count = 0
         self._update_buttons()
         region = self._region
         self.status.set(f"{self._page_name}: " + (
@@ -863,6 +872,7 @@ class HandwritingApp(tk.Tk):
                 lines = self.recognizer.recognize_page(
                     image, progress=lambda done, total: self._events.put(("progress", (done, total))),
                     cancel_event=cancel_event,
+                    on_line=lambda line: self._events.put(("partial_line", line)),
                 )
         except Exception as exc:
             log.exception("Read failed after %.1fs", time.monotonic() - started)
@@ -891,6 +901,13 @@ class HandwritingApp(tk.Tk):
         def progress(done, total):
             self._events.put(("progress", (done, total)))
 
+        # Qwen has no line boundaries mid-read for on_line's sake, but it
+        # does stream tokens -- see page_reader._generate_streamed -- so the
+        # transcript and the percent in the status line both grow with the
+        # text itself instead of waiting for the whole page to finish.
+        def on_text(text, percent):
+            self._events.put(("partial_text", (text, percent)))
+
         # Started before Qwen so the two overlap for the whole read rather
         # than TrOCR only picking up whatever's left once Qwen returns. Its
         # own progress is not wired to the status line: whole-page mode
@@ -912,7 +929,7 @@ class HandwritingApp(tk.Tk):
 
         read = self.page_reader.read_region if region else self.page_reader.read_page
         try:
-            texts = read(image, progress=progress, cancel_event=cancel_event)
+            texts = read(image, progress=progress, cancel_event=cancel_event, on_text=on_text)
         except Exception:
             # Qwen raising (a stuck read timing out -- see GENERATION_TIMEOUT_S
             # in page_reader.py) must not leave the cross-check reading on in
@@ -963,12 +980,49 @@ class HandwritingApp(tk.Tk):
         self._events.put(("status", message))
 
     def _update_progress(self, done: int, total: int):
+        # Whole-page mode gets its own, more accurate percent from the token
+        # stream (see _show_partial_text) -- this done/total pair only ever
+        # reaches 0/1 or 1/1 for it, a piece count rather than a read one,
+        # so it is left out of that branch rather than showing a number that
+        # would jump straight from 0% to 100%.
+        percent = round(100 * done / total) if total else 0
         if self._region:
-            self.status.set(f"{self._page_name}: читаю выделенный участок…")
+            self.status.set(f"{self._page_name}: читаю выделенный участок… {percent}%")
         elif self.whole_page:
             self.status.set(f"{self._page_name}: читаю страницу целиком…")
         else:
-            self.status.set(f"{self._page_name}: строка {done} из {total}")
+            self.status.set(f"{self._page_name}: строка {done} из {total} ({percent}%)")
+
+    def _show_partial_text(self, text: str, percent: float):
+        """Live preview while Qwen is still generating -- see page_reader.py's
+        _generate_streamed. _show_results replaces this wholesale once the
+        read actually finishes, so there is no confidence tinting here yet;
+        the percent is what belongs in the status line, per the request to
+        show it there specifically."""
+        if self.ui.itemcget(self._text_window, "state") == "hidden":
+            self.ui.itemconfigure(self._text_window, state="normal")
+            self._update_text_zoom_controls()
+        self.text.delete("1.0", tk.END)
+        self.text.insert(tk.END, text)
+        action = "читаю выделенный участок" if self._region else "читаю страницу целиком"
+        self.status.set(f"{self._page_name}: {action}… {percent:.0f}%")
+
+    def _append_partial_line(self, line: RecognizedLine):
+        """Line-by-line mode has no token stream to show mid-line the way
+        whole-page mode does, but every completed line is already its own
+        step (see Recognizer.recognize_page's on_line) -- shown the moment
+        it is read rather than making someone wait for the whole page, with
+        the same low/medium tinting _show_results gives it at the end."""
+        if self.ui.itemcget(self._text_window, "state") == "hidden":
+            self.ui.itemconfigure(self._text_window, state="normal")
+            self._update_text_zoom_controls()
+        self._partial_line_count += 1
+        i = self._partial_line_count
+        self.text.insert(tk.END, line.text + "\n")
+        if line.confidence < LOW_CONFIDENCE:
+            self.text.tag_add("low", f"{i}.0", f"{i}.end")
+        elif line.confidence < MEDIUM_CONFIDENCE:
+            self.text.tag_add("medium", f"{i}.0", f"{i}.end")
 
     def _recognize_failed(self, exc: Exception, whole: bool):
         self._busy = False

@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 import time
 
 import torch
@@ -283,7 +284,7 @@ class PageReader:
                  adapter_dir if self.adapter_loaded else "none")
 
     def read_page(self, page_bgr, max_new_tokens: int = 1024, progress=None,
-                  cancel_event=None) -> list[str]:
+                  cancel_event=None, on_text=None) -> list[str]:
         """Read a photographed page.
 
         The photo is cropped to the sheet, straightened, and separated into
@@ -303,6 +304,13 @@ class PageReader:
         flight, rather than starting the other one, and a single page stops
         wherever generation had got to, keeping what it had already written
         rather than discarding it.
+
+        on_text, if given, is called as on_text(text, percent) with the
+        whole transcript so far and a rough completion estimate every time
+        the model writes more of it -- see _generate_streamed for what
+        percent means. Earlier pieces' already-finished text is kept in
+        front of it, so a spread's second page streams in after the first
+        rather than replacing it; percent restarts for each new piece.
         """
         page_bgr, _ = crop_to_page(page_bgr)
         page_bgr, _ = deskew(page_bgr)
@@ -314,12 +322,18 @@ class PageReader:
                 break
             if progress:
                 progress(i, len(pieces))
-            lines.extend(self._read_one(piece, max_new_tokens, cancel_event))
+            piece_on_text = None
+            if on_text is not None:
+                done_so_far = "\n".join(lines)
+                prefix = done_so_far + "\n" if done_so_far else ""
+                piece_on_text = lambda t, percent, prefix=prefix: on_text(prefix + t, percent)
+            lines.extend(self._read_one(piece, max_new_tokens, cancel_event, piece_on_text))
         if progress:
             progress(len(pieces), len(pieces))
         return lines
 
-    def _read_one(self, page_bgr, max_new_tokens: int = 1024, cancel_event=None) -> list[str]:
+    def _read_one(self, page_bgr, max_new_tokens: int = 1024, cancel_event=None,
+                  on_text=None) -> list[str]:
         import cv2
 
         image = Image.fromarray(cv2.cvtColor(page_bgr, cv2.COLOR_BGR2RGB))
@@ -340,9 +354,12 @@ class PageReader:
             "stopping_criteria": _stopping_criteria(started, GENERATION_TIMEOUT_S, cancel_event),
         }
 
-        with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
-                                      **generate_kwargs)
+        if on_text is not None:
+            out = self._generate_streamed(inputs, max_new_tokens, generate_kwargs, on_text)
+        else:
+            with torch.no_grad():
+                out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                                          **generate_kwargs)
         elapsed = time.monotonic() - started
         new_tokens = out.shape[1] - prompt_tokens
 
@@ -377,7 +394,66 @@ class PageReader:
                 f"чтение застряло: {elapsed:.0f} с без остановки, {new_tokens} токенов")
         return lines
 
-    def read_region(self, region_bgr, progress=None, cancel_event=None) -> list[str]:
+    def _generate_streamed(self, inputs, max_new_tokens, generate_kwargs, on_text):
+        """Same call as the plain branch in _read_one, except on_text(text,
+        percent) is handed the transcript so far and how far through
+        max_new_tokens generation has got, every time the model writes
+        more -- so a stuck or looping read shows itself directly on screen,
+        percentage included, instead of behind a status line that says the
+        same thing for however long it takes. percent is a ceiling-budget
+        estimate, not a true completion fraction (most reads stop well
+        before max_new_tokens, at the actual end of the page's text), but it
+        is the same basis GENERATION_TIMEOUT_S itself is judged against, so
+        a number that keeps climbing past what a normal page needs is
+        exactly the situation both exist to catch.
+
+        generate() blocks until it is completely done, streamer included,
+        so it cannot be called on this thread and read from at the same
+        time -- transformers' own documented pattern for this is to run it
+        on a second thread and consume the streamer here. Errors from that
+        thread (including a genuine CUDA out-of-memory crash) are carried
+        back and re-raised here rather than lost, since a background
+        thread's own exception has nowhere else to go."""
+        from transformers import TextIteratorStreamer
+
+        token_count = [0]
+
+        class _CountingStreamer(TextIteratorStreamer):
+            def put(self, value):
+                try:
+                    token_count[0] += value.numel()
+                except Exception:      # a count that fails to update is not
+                    pass                # worth losing the read over
+                super().put(value)
+
+        streamer = _CountingStreamer(
+            self.processor, skip_prompt=True, skip_special_tokens=True)
+
+        result: list = []
+        error: list[BaseException] = []
+
+        def run():
+            try:
+                with torch.no_grad():
+                    result.append(self.model.generate(
+                        **inputs, max_new_tokens=max_new_tokens, do_sample=False,
+                        streamer=streamer, **generate_kwargs))
+            except BaseException as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        accumulated = ""
+        for chunk in streamer:
+            accumulated += chunk
+            percent = min(100.0, 100.0 * token_count[0] / max_new_tokens) if max_new_tokens else 0.0
+            on_text(accumulated, percent)
+        thread.join()
+        if error:
+            raise error[0]
+        return result[0]
+
+    def read_region(self, region_bgr, progress=None, cancel_event=None, on_text=None) -> list[str]:
         """Read exactly the piece someone drew a box around.
 
         None of read_page's preparation happens here. Cropping and
@@ -388,7 +464,7 @@ class PageReader:
         """
         if progress:
             progress(0, 1)
-        lines = self._read_one(region_bgr, cancel_event=cancel_event)
+        lines = self._read_one(region_bgr, cancel_event=cancel_event, on_text=on_text)
         if progress:
             progress(1, 1)
         return lines
