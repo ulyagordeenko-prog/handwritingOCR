@@ -12,11 +12,11 @@ Whole-page reading has no per-token confidence of its own, and its failure
 mode is worse than just being unsure: on a stretch it cannot actually read
 it can write a fluent, invented sentence that looks exactly like a correct
 one. So every whole-page read is silently cross-checked against the line
-recognizer's own independent reading of the same image, run alongside it
-rather than after so the smaller model's pass costs little beyond what it
-already spends idle, and a line with no trace in that second reading is
-tinted the same way a low-confidence line already is -- see
-_read_whole_page and _agreement_scores.
+recognizer's own independent reading of the same image, run first -- the
+two were tried running at once, but they share one GPU, so "at once" meant
+contending for it, not overlapping for free -- and a line with no trace in
+that second reading is tinted the same way a low-confidence line already
+is -- see _read_whole_page and _agreement_scores.
 
 The window is the Figma design (design/window.svg and design/content.svg):
 its frosted background, glass panels, button faces and legend are
@@ -925,13 +925,41 @@ class HandwritingApp(tk.Tk):
         it fails is not by looking unsure -- on a stretch it cannot actually
         read it can write a fluent, plausible, entirely invented sentence
         instead, which looks exactly like a correct one. So each line is
-        checked against a second, independent reading, run at the same time
-        rather than after -- the two models are already both resident
-        regardless of mode (see _load_model), and Qwen's own generation is
-        the long pole here, so a much smaller model reading alongside it
-        costs little beyond what was already being spent standing idle."""
+        checked against a second, independent reading -- the line-by-line
+        model, run first, then Qwen, then the two compared.
+
+        Tried running them at the same time instead, on the theory that
+        Qwen's own generation was the long pole and a much smaller model
+        reading alongside it would cost little beyond what was already
+        being spent standing idle -- measured wrong on real hardware: both
+        models share the one GPU, so "alongside" meant contending for it,
+        not overlapping for free. A real page: 14 lines that should take
+        under two minutes at this beam width took 12.4 minutes running
+        concurrently, one line even timing out under the extra load. One
+        after another, each gets the whole card to itself and finishes at
+        its own real speed."""
         if self.page_reader is None:
             self._load_page_reader()
+
+        self._events.put(("status", f"{self._page_name}: сверяю по строкам…"))
+        trocr_lines: list[RecognizedLine] = []
+        trocr_error: list[Exception] = []
+        try:
+            trocr_lines = self.recognizer.recognize_page(
+                image, num_beams=2, cancel_event=cancel_event,
+                progress=lambda done, total: self._events.put(
+                    ("status", f"{self._page_name}: сверяю по строкам… {done} из {total}")),
+                on_line=lambda line: self._events.put(("partial_line", line)),
+            )
+        except Exception as exc:      # collected, not raised: see _agreement_scores
+            trocr_error.append(exc)
+
+        if cancel_event.is_set():
+            # Cancel reached during the line-by-line pass: what it already
+            # read is the whole result, the same way a cancel mid-Qwen-read
+            # keeps whatever text had streamed in so far -- see on_cancel.
+            return trocr_lines
+
         def progress(done, total):
             self._events.put(("progress", (done, total)))
 
@@ -942,40 +970,9 @@ class HandwritingApp(tk.Tk):
         def on_text(text, percent):
             self._events.put(("partial_text", (text, percent)))
 
-        # Started before Qwen so the two overlap for the whole read rather
-        # than TrOCR only picking up whatever's left once Qwen returns. Its
-        # own progress is not wired to the status line: whole-page mode
-        # already shows one fixed message for the whole read (see
-        # _update_progress), so a second source of "progress" events here
-        # would only make that line flicker, not say anything truer.
-        trocr_lines: list[RecognizedLine] = []
-        trocr_error: list[Exception] = []
-
-        def run_cross_check():
-            try:
-                trocr_lines.extend(self.recognizer.recognize_page(
-                    image, num_beams=2, cancel_event=cancel_event))
-            except Exception as exc:      # collected, not raised: see _agreement_scores
-                trocr_error.append(exc)
-
-        cross_check_thread = threading.Thread(target=run_cross_check, daemon=True)
-        cross_check_thread.start()
-
         read = self.page_reader.read_region if region else self.page_reader.read_page
-        try:
-            texts = read(image, progress=progress, cancel_event=cancel_event, on_text=on_text)
-        except Exception:
-            # Qwen raising (a stuck read timing out -- see GENERATION_TIMEOUT_S
-            # in page_reader.py) must not leave the cross-check reading on in
-            # the background with nobody waiting on it: signal it to stop at
-            # its own next checkpoint and join before this re-raises. Setting
-            # cancel_event here specifically, not in a plain finally, so a
-            # clean read is never mistaken for one the person cancelled.
-            cancel_event.set()
-            cross_check_thread.join()
-            raise
+        texts = read(image, progress=progress, cancel_event=cancel_event, on_text=on_text)
 
-        cross_check_thread.join()
         confidences = self._agreement_scores(texts, trocr_lines, trocr_error)
         return [
             RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=c, image=None)
@@ -986,7 +983,7 @@ class HandwritingApp(tk.Tk):
                            trocr_error: list[Exception]) -> list[float]:
         """How much of each of Qwen's lines actually turns up in the
         line-by-line recognizer's own, independent reading of the same
-        image, run concurrently with Qwen's own (see _read_whole_page).
+        image, run first (see _read_whole_page).
 
         The two engines fail in different ways -- the line-by-line model
         garbles a hard word or leaves a line blank, it does not compose a
@@ -998,9 +995,9 @@ class HandwritingApp(tk.Tk):
         segmentation differs and mistakes differ.
 
         Fails open (1.0, i.e. trusted, for every line) if the second
-        reading itself raised (passed in via trocr_error, since it ran on
-        another thread): a broken cross-check must not block the primary
-        result the person actually asked for."""
+        reading itself raised (passed in via trocr_error): a broken
+        cross-check must not block the primary result the person actually
+        asked for."""
         if not lines:
             return []
         if trocr_error:
