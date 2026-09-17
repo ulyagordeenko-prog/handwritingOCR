@@ -53,6 +53,7 @@ PYTHONW = os.path.join(APP_DIR, ".venv", "Scripts", "pythonw.exe")
 PYTHON = os.path.join(APP_DIR, ".venv", "Scripts", "python.exe")
 INSTALLED_EXE = os.path.join(HOME, f"{APP_NAME}.exe")
 APP_LOG = os.path.join(HOME, "app.log")
+INSTALL_LOG = os.path.join(HOME, "install.log")
 UNINSTALL_KEY = rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{APP_NAME}"
 
 NO_WINDOW = 0x08000000          # CREATE_NO_WINDOW: no console flashing up
@@ -101,6 +102,22 @@ def clean_env() -> dict:
 
 class Failed(Exception):
     """A step that went wrong, with a message a person can act on."""
+
+
+def log_line(text: str):
+    """A permanent record of what an install/update/repair actually did --
+    unlike the progress window's detail line, which is gone the moment it
+    closes. Exists so a question like "why did it download the big stuff
+    again" has an answer next time instead of a guess: which plan ran,
+    whether the library-skip check fired and why, and what each download
+    step actually fetched. Never raises -- a logging failure must not turn
+    into an install failure."""
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        with open(INSTALL_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError:
+        pass
 
 
 # -- state --------------------------------------------------------------------
@@ -201,12 +218,14 @@ class Installer:
             if line:
                 tail = (tail + [line])[-15:]
                 self.post("detail", line)
+                log_line(f"  [{what}] {line}")
         proc.wait(timeout=timeout)
         if proc.returncode != 0:
             raise Failed(f"{what} не удалось.\n\n" + "\n".join(tail[-6:]))
 
     def download(self, url, what) -> bytes:
         req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(req, timeout=60) as r:
                 total = int(r.headers.get("Content-Length") or 0)
@@ -216,8 +235,12 @@ class Installer:
                     done += len(chunk)
                     size = f" из {total / 1e6:.0f} МБ" if total else ""
                     self.post("detail", f"{what}: {done / 1e6:.1f} МБ{size}")
+                log_line(f"  downloaded {what}: {done / 1e6:.1f} MB in "
+                         f"{time.monotonic() - started:.1f}s ({url})")
                 return buf.getvalue()
         except OSError as exc:
+            log_line(f"  FAILED downloading {what} after "
+                     f"{time.monotonic() - started:.1f}s: {exc}")
             raise Failed(f"Не получилось скачать {what}. Проверьте интернет.\n\n{exc}")
 
     def fetch_app(self):
@@ -259,7 +282,10 @@ class Installer:
         # An update that changed only the app's own code leaves the libraries
         # as they are: a sync would swap PyTorch back to the pinned build and
         # the next step swap it forward again -- minutes of churn for nothing.
-        self.skip_deps = self.plan == "update" and load_state().get("deps") == deps_digest()
+        saved, current = load_state().get("deps"), deps_digest()
+        self.skip_deps = self.plan == "update" and saved == current
+        log_line(f"libraries: plan={self.plan} skip_deps={self.skip_deps} "
+                 f"saved_deps={saved} current_deps={current}")
         if self.skip_deps:
             self.post("detail", "Библиотеки не изменились")
             return
@@ -574,14 +600,23 @@ def run_with_window(plan: str, shortcuts=True, quiet=False) -> bool:
     worker = Installer(lambda kind, value: events.put((kind, value)), plan, shortcuts)
 
     def work():
+        log_line(f"=== {plan} start ===")
         try:
             for i, (label, method) in enumerate(steps):
+                log_line(f"step {i + 1}/{len(steps)}: {label}")
                 events.put(("step", (i, label)))
                 getattr(worker, method)()
+            log_line(f"=== {plan} done ===")
             events.put(("done", None))
         except Failed as exc:
+            # Logged even when quiet=True swallows the dialog: a background
+            # update that keeps failing must leave a trace somewhere, or the
+            # next launch retries the same expensive steps with nothing to
+            # show why it was needed again.
+            log_line(f"=== {plan} FAILED: {exc} ===")
             events.put(("failed", str(exc)))
         except Exception as exc:          # anything unexpected still reaches the user
+            log_line(f"=== {plan} FAILED (unexpected): {type(exc).__name__}: {exc} ===")
             events.put(("failed", f"{type(exc).__name__}: {exc}"))
 
     def drain():
@@ -794,6 +829,8 @@ def main(argv=None) -> int:
             return 0
         splash = Splash()
         newest = splash.run(latest_commit, "Проверяю обновления…")
+        log_line(f"launch: installed_sha={load_state().get('sha')} "
+                 f"latest_sha={newest}")
         # An update is not a question any more: nobody wants to decide this at
         # every launch, and the answer is always yes. An unrecorded version
         # counts as old, or it would never be updated. Most updates change only
