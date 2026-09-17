@@ -888,6 +888,37 @@ class HandwritingApp(tk.Tk):
                  " [cancelled]" if cancel_event.is_set() else "")
         self._events.put(("recognized", (name, lines, cancel_event.is_set())))
 
+    def _load_page_reader(self):
+        """First whole-page read of the session: the ~17 GB of full-precision
+        weights (quantized to ~5-6 GB only once they're in VRAM -- see
+        page_reader.py's module docstring) has to come off the network
+        before anything can be read, and on an ordinary connection that is
+        long enough that a status line stuck on one sentence the whole time
+        looks exactly like a hang -- a real report this app produced (see
+        app.log: the download was still at its first file when it was sent).
+        A tick every few seconds with the elapsed time is the same fix
+        _read_one's own timeout logic exists for: showing that something is
+        still moving, not just saying so once and going quiet. Cached by
+        huggingface_hub afterwards, so this only happens the first time."""
+        done = threading.Event()
+
+        def tick():
+            started = time.monotonic()
+            while not done.wait(4):
+                elapsed = time.monotonic() - started
+                self._events.put(("status",
+                    f"Загружаю модель чтения страницы (первый раз, ~17 ГБ, "
+                    f"дальше не потребуется)… {elapsed:.0f} с"))
+
+        self._events.put(("status", "Загружаю модель чтения страницы "
+                                    "(первый раз, ~17 ГБ, дальше не потребуется)…"))
+        ticker = threading.Thread(target=tick, daemon=True)
+        ticker.start()
+        try:
+            self.page_reader = page_reader.PageReader(offload=self._slow_whole_page)
+        finally:
+            done.set()
+
     def _read_whole_page(self, image, region: bool, cancel_event: threading.Event):
         """Qwen3-VL reads the page in one pass. It has no per-token
         probability of its own to colour lines by, and worse, the one place
@@ -900,9 +931,7 @@ class HandwritingApp(tk.Tk):
         the long pole here, so a much smaller model reading alongside it
         costs little beyond what was already being spent standing idle."""
         if self.page_reader is None:
-            self._events.put(("status", "Загружаю модель чтения страницы "
-                                        "(в первый раз качается ~6 ГБ)…"))
-            self.page_reader = page_reader.PageReader(offload=self._slow_whole_page)
+            self._load_page_reader()
         def progress(done, total):
             self._events.put(("progress", (done, total)))
 
