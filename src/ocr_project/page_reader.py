@@ -83,6 +83,18 @@ PROMPT = (
 # _recognize_failed.
 GENERATION_TIMEOUT_S = 120.0
 
+# The denominator for the streaming percent shown while Qwen is still
+# generating (see _generate_streamed) -- a rough middle estimate from real
+# transcripts (roughly 800-2000 characters, a few hundred tokens once
+# encoded), not a measured figure for this exact model. Only cosmetic: it
+# never limits what the model can actually write, that is max_new_tokens'
+# job. A page longer than this just sits at 99% for a while rather than
+# climbing past it, which reads as "still working" rather than "done" --
+# the choice this exists to avoid is the opposite one, a percent stuck
+# near zero for an ordinary page because it was measured against a ceiling
+# real reads rarely approach.
+TYPICAL_PAGE_TOKENS = 400
+
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
 
@@ -409,16 +421,22 @@ class PageReader:
 
     def _generate_streamed(self, inputs, max_new_tokens, generate_kwargs, on_text):
         """Same call as the plain branch in _read_one, except on_text(text,
-        percent) is handed the transcript so far and how far through
-        max_new_tokens generation has got, every time the model writes
-        more -- so a stuck or looping read shows itself directly on screen,
-        percentage included, instead of behind a status line that says the
-        same thing for however long it takes. percent is a ceiling-budget
-        estimate, not a true completion fraction (most reads stop well
-        before max_new_tokens, at the actual end of the page's text), but it
-        is the same basis GENERATION_TIMEOUT_S itself is judged against, so
-        a number that keeps climbing past what a normal page needs is
-        exactly the situation both exist to catch.
+        percent) is handed the transcript so far and roughly how far into
+        a typical page's worth of it generation has got, every time the
+        model writes more -- so a stuck or looping read shows itself
+        directly on screen, percentage included, instead of behind a
+        status line that says the same thing for however long it takes.
+
+        percent is measured against TYPICAL_PAGE_TOKENS, not max_new_tokens
+        itself -- an earlier version used the real ceiling as the
+        denominator, reasoning that it shared GENERATION_TIMEOUT_S's own
+        basis for "this has gone on too long". Measured wrong against a
+        real read: an ordinary page finishes in a few hundred tokens, well
+        under max_new_tokens' 1024, so the percent barely moved before the
+        page was already done -- reported live as "no visible progress" on
+        the very model this exists to show progress for. Capped at 99
+        while still generating, not 100: a page that is a little longer
+        than typical should read as still working, not as finished early.
 
         generate() blocks until it is completely done, streamer included,
         so it cannot be called on this thread and read from at the same
@@ -433,10 +451,19 @@ class PageReader:
 
         class _CountingStreamer(TextIteratorStreamer):
             def put(self, value):
-                try:
-                    token_count[0] += value.numel()
-                except Exception:      # a count that fails to update is not
-                    pass                # worth losing the read over
+                # The streamer's very first put() call carries the whole
+                # prompt, not a generated token -- for a full-page image
+                # that is itself hundreds to thousands of vision tokens.
+                # next_tokens_are_prompt is the same flag the base class
+                # uses to skip printing that call when skip_prompt=True;
+                # read here before super().put() flips it, so the count
+                # tracks generated tokens only, the same thing skip_prompt
+                # already promises the decoded text does.
+                if not (self.skip_prompt and self.next_tokens_are_prompt):
+                    try:
+                        token_count[0] += value.numel()
+                    except Exception:  # a count that fails to update is not
+                        pass            # worth losing the read over
                 super().put(value)
 
         streamer = _CountingStreamer(
@@ -459,7 +486,7 @@ class PageReader:
         accumulated = ""
         for chunk in streamer:
             accumulated += chunk
-            percent = min(100.0, 100.0 * token_count[0] / max_new_tokens) if max_new_tokens else 0.0
+            percent = min(99.0, 100.0 * token_count[0] / TYPICAL_PAGE_TOKENS)
             on_text(accumulated, percent)
         thread.join()
         if error:
