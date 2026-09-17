@@ -898,14 +898,25 @@ class HandwritingApp(tk.Tk):
         "downloading ~17 GB" regardless of which case this is was itself a
         reported bug -- a person who had already downloaded and used the
         model successfully saw that same alarming message again on the next
-        launch's first read. model_cached() tells the two apart up front
-        without touching the network, so only a real download gets the
-        warning and the elapsed-seconds ticker below; a cache hit gets one
-        plain line and whatever couple of seconds loading actually takes."""
-        if page_reader.model_cached():
-            self._events.put(("status", "Загружаю модель чтения страницы…"))
-            self.page_reader = page_reader.PageReader(offload=self._slow_whole_page)
-            return
+        launch's first read.
+
+        Tried telling the two cases apart with a separate "is this cached"
+        check first (huggingface_hub's snapshot_download); that asks a
+        different question than the one that matters, since a model repo
+        can hold files from_pretrained never actually needs, and counts
+        those missing right along with the ones that would matter -- it
+        said "not cached" every time, even right after a real, complete
+        download, which is the same bug over again with worse evidence
+        behind it. Trying the real, local-only load first and catching the
+        failure asks the only question that counts: can this actually load
+        without the network, using the exact same call that will load it
+        for real either way."""
+        try:
+            self.page_reader = page_reader.PageReader(
+                offload=self._slow_whole_page, local_files_only=True)
+            return          # every file it needed was already on disk
+        except Exception:
+            pass            # not fully cached -- fall through to a real download
 
         done = threading.Event()
 

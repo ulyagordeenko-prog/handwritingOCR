@@ -83,25 +83,6 @@ PROMPT = (
 # _recognize_failed.
 GENERATION_TIMEOUT_S = 120.0
 
-def model_cached() -> bool:
-    """Whether MODEL_NAME's weights are already sitting on disk.
-
-    Touches only the local cache, never the network -- so the caller can
-    warn about a real first-ever download (~17 GB, can take tens of
-    minutes) without also showing that same warning on every ordinary
-    launch afterwards, when from_pretrained is really just loading the
-    same files off disk in seconds. A real app.log showed exactly that
-    confusion: the "first time" message fired on a session that had
-    already downloaded and used the model successfully before."""
-    from huggingface_hub import snapshot_download
-
-    try:
-        snapshot_download(MODEL_NAME, local_files_only=True)
-        return True
-    except Exception:
-        return False
-
-
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
 
@@ -263,7 +244,19 @@ def _split_across(gpu_reserve_gb: float = 1.0) -> dict:
 
 class PageReader:
     def __init__(self, quantize: bool = True, adapter_dir: str | None = DEFAULT_ADAPTER,
-                 offload: bool = False):
+                 offload: bool = False, local_files_only: bool = False):
+        """local_files_only forbids any network call: from_pretrained raises
+        at once if a needed file is not already cached, instead of fetching
+        it. Callers use this to try the fast, local-only path first and
+        fall back to a real download only if that actually raises -- see
+        app.py's _load_page_reader, which is also where and why this
+        matters: asking huggingface_hub itself "is this fully cached" (as
+        an earlier version of this function did, via snapshot_download)
+        answers a different question than this one, because a model repo
+        can hold files from_pretrained never needs at all, and treats
+        those as missing right along with the ones that matter -- which
+        made that check say "not cached" every single time, even right
+        after a real, complete, successful download."""
         from transformers import AutoModelForImageTextToText, AutoProcessor
 
         if offload:
@@ -286,9 +279,10 @@ class PageReader:
                     bnb_4bit_quant_type="nf4",
                 )
 
+        kwargs["local_files_only"] = local_files_only
         started = time.monotonic()
         self.model = AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kwargs)
-        self.processor = AutoProcessor.from_pretrained(MODEL_NAME)
+        self.processor = AutoProcessor.from_pretrained(MODEL_NAME, local_files_only=local_files_only)
 
         self.adapter_loaded = False
         if adapter_dir and os.path.isfile(os.path.join(adapter_dir, "adapter_config.json")):
