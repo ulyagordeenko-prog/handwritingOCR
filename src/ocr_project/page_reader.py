@@ -83,6 +83,25 @@ PROMPT = (
 # _recognize_failed.
 GENERATION_TIMEOUT_S = 120.0
 
+def model_cached() -> bool:
+    """Whether MODEL_NAME's weights are already sitting on disk.
+
+    Touches only the local cache, never the network -- so the caller can
+    warn about a real first-ever download (~17 GB, can take tens of
+    minutes) without also showing that same warning on every ordinary
+    launch afterwards, when from_pretrained is really just loading the
+    same files off disk in seconds. A real app.log showed exactly that
+    confusion: the "first time" message fired on a session that had
+    already downloaded and used the model successfully before."""
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(MODEL_NAME, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
 # rough floor: 4-bit weights are ~5-6 GB, plus room for the image tokens
 MIN_VRAM_BYTES = 7 * 1024**3
 

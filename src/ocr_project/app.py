@@ -889,17 +889,24 @@ class HandwritingApp(tk.Tk):
         self._events.put(("recognized", (name, lines, cancel_event.is_set())))
 
     def _load_page_reader(self):
-        """First whole-page read of the session: the ~17 GB of full-precision
-        weights (quantized to ~5-6 GB only once they're in VRAM -- see
-        page_reader.py's module docstring) has to come off the network
-        before anything can be read, and on an ordinary connection that is
-        long enough that a status line stuck on one sentence the whole time
-        looks exactly like a hang -- a real report this app produced (see
-        app.log: the download was still at its first file when it was sent).
-        A tick every few seconds with the elapsed time is the same fix
-        _read_one's own timeout logic exists for: showing that something is
-        still moving, not just saying so once and going quiet. Cached by
-        huggingface_hub afterwards, so this only happens the first time."""
+        """First whole-page read *this process has done*, which is not the
+        same thing as the first time ever: self.page_reader is remade from
+        nothing on every launch, but the ~17 GB of weights it loads (see
+        page_reader.py's module docstring) stay cached on disk from the
+        first real download onward, and loading them from there again takes
+        seconds, not the tens of minutes a genuine download can. Saying
+        "downloading ~17 GB" regardless of which case this is was itself a
+        reported bug -- a person who had already downloaded and used the
+        model successfully saw that same alarming message again on the next
+        launch's first read. model_cached() tells the two apart up front
+        without touching the network, so only a real download gets the
+        warning and the elapsed-seconds ticker below; a cache hit gets one
+        plain line and whatever couple of seconds loading actually takes."""
+        if page_reader.model_cached():
+            self._events.put(("status", "Загружаю модель чтения страницы…"))
+            self.page_reader = page_reader.PageReader(offload=self._slow_whole_page)
+            return
+
         done = threading.Event()
 
         def tick():
