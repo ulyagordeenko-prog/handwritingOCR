@@ -444,7 +444,22 @@ class PageReader:
         on a second thread and consume the streamer here. Errors from that
         thread (including a genuine CUDA out-of-memory crash) are carried
         back and re-raised here rather than lost, since a background
-        thread's own exception has nowhere else to go."""
+        thread's own exception has nowhere else to go.
+
+        The streamer itself is given GENERATION_TIMEOUT_S as its own
+        timeout, so waiting for the next chunk raises queue.Empty rather
+        than blocking forever -- generate_kwargs' own StoppingCriteria
+        cannot cover every way this can get stuck, only the ones where it
+        has already produced at least one token to be checked between:
+        real reads showed generate() never reaching that first check at
+        all, stuck processing the page image itself before writing
+        anything -- nothing to check between yet, so nothing to catch it
+        with from the inside. The thread is left running rather than
+        joined in that case: a stuck CUDA call has no safe way to be
+        killed from Python, so this only stops waiting on it, not the
+        call itself."""
+        import queue
+
         from transformers import TextIteratorStreamer
 
         token_count = [0]
@@ -467,7 +482,8 @@ class PageReader:
                 super().put(value)
 
         streamer = _CountingStreamer(
-            self.processor, skip_prompt=True, skip_special_tokens=True)
+            self.processor, skip_prompt=True, skip_special_tokens=True,
+            timeout=GENERATION_TIMEOUT_S)
 
         result: list = []
         error: list[BaseException] = []
@@ -484,10 +500,15 @@ class PageReader:
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         accumulated = ""
-        for chunk in streamer:
-            accumulated += chunk
-            percent = min(99.0, 100.0 * token_count[0] / TYPICAL_PAGE_TOKENS)
-            on_text(accumulated, percent)
+        try:
+            for chunk in streamer:
+                accumulated += chunk
+                percent = min(99.0, 100.0 * token_count[0] / TYPICAL_PAGE_TOKENS)
+                on_text(accumulated, percent)
+        except queue.Empty:
+            raise TimeoutError(
+                f"чтение застряло: нет ответа {GENERATION_TIMEOUT_S:.0f} с "
+                f"(не дошло даже до первого слова)")
         thread.join()
         if error:
             raise error[0]
