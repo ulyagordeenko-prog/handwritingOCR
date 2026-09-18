@@ -154,8 +154,12 @@ class Recognizer:
             out = self.model.generate(
                 pixel_values,
                 # Full lines need far more tokens than the word crops the
-                # adapter was trained on; 32 visibly truncated long lines.
-                max_new_tokens=96,
+                # adapter was trained on; 32 visibly truncated long lines,
+                # 96 still does on an unusually long, densely-written one --
+                # see the truncated-sequence check below, added after a
+                # report of lines missing their last few words on a full-
+                # width page with small handwriting.
+                max_new_tokens=128,
                 # Beam search keeps several candidate continuations alive
                 # instead of committing to the single most-likely token at
                 # every step, so it can recover from an early greedy misstep.
@@ -185,6 +189,8 @@ class Recognizer:
             out.sequences, out.scores, beam_indices, normalize_logits=True
         )
 
+        eos_id = self.processor.tokenizer.eos_token_id
+        truncated_count = 0
         results = []
         for sample in range(len(line_crops)):
             # generate() returns num_return sequences per input, grouped by
@@ -215,7 +221,23 @@ class Recognizer:
                 # either way, and this line needs a second look regardless.
                 confidence = 0.0
 
+            # A line that never emitted the end token ran out of budget
+            # mid-word rather than finishing -- unlike a genuinely unsure
+            # word, the tokens it did write can each still look perfectly
+            # probable, so this would otherwise pass through at high
+            # confidence missing its last few words. Checked per sequence,
+            # not by comparing the batch's padded length to max_new_tokens:
+            # generate() pads every return to the longest one in the batch,
+            # so a short truncated line can still look "not at the ceiling"
+            # next to a long finished one.
+            if eos_id is not None and eos_id not in out.sequences[lo + best_k].tolist():
+                confidence = 0.0
+                truncated_count += 1
+
             results.append((texts[best_k], confidence))
+        if truncated_count:
+            log.warning("_recognize_batch: %d/%d line(s) ran out of tokens before finishing",
+                       truncated_count, len(line_crops))
         return results
 
     def recognize_page(self, page_bgr: np.ndarray, progress=None, batch_size: int = 1,
