@@ -111,10 +111,26 @@ def main() -> int:
     ap.add_argument("--per-condition", type=int, default=12)
     ap.add_argument("--train-out", default="train_pages.jsonl.gz")
     ap.add_argument("--holdout-out", default="holdout_pages.jsonl")
+    ap.add_argument("--rotation-flags", default="rotation_flags.jsonl")
     args = ap.parse_args()
+
+    # Pages the app's users never produce: they photograph their own page
+    # upright. HWR200 has some shot or scanned sideways instead (no reliable
+    # way to tell which way to un-rotate them -- the same page's scan and
+    # photo can be sideways in opposite directions), so training on them as-is
+    # would just pair the label with a rotated image the model will never see
+    # at inference. Dropped rather than fixed.
+    rotated = set()
+    if os.path.exists(args.rotation_flags):
+        with open(args.rotation_flags, encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                if r.get("likely_rotated"):
+                    rotated.add((r["zip"], r["image"]))
 
     rows, seen = [], set()
     marked = 0
+    dropped_rotated = 0
     for path in args.hwr:
         with open(path, encoding="utf-8") as f:
             for line in f:
@@ -123,6 +139,9 @@ def main() -> int:
                 if key in seen:
                     continue
                 seen.add(key)
+                if key in rotated:
+                    dropped_rotated += 1
+                    continue
                 marked += PARAGRAPH_MARK in r["text"]
                 r["text"] = clean_label(r["text"])
                 if not r["text"]:
@@ -209,7 +228,8 @@ def main() -> int:
 
     sources = Counter(r["source"] for r in train)
     print(f"HWR200: страниц {len(rows)}, почерков {len(by_writer)}, "
-          f"пометка абзаца убрана на {marked} страницах")
+          f"пометка абзаца убрана на {marked} страницах, "
+          f"выброшено как повёрнутые {dropped_rotated}")
     print(f"  в обучение {sources['hwr200']}, на проверку {len(holdout)} "
           f"(почерков {len(held)}), не взято {set_aside} -- страницы отложенных почерков "
           f"с текстами, которые писал кто-то ещё")

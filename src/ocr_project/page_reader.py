@@ -153,6 +153,35 @@ def trim_runaway(lines: list[str], max_repeats: int = 3) -> list[str]:
     return out
 
 
+def trailing_loop(lines: list[str], min_repeats: int = 3) -> int:
+    """How many lines at the very end of a read are one short fragment
+    repeated, with nothing after it -- generation settling into an
+    attractor it never escapes before EOS or the token budget ends it.
+
+    trim_runaway allows up to max_repeats copies through, since real
+    handwriting does sometimes repeat a whole line on purpose (see its own
+    docstring). That allowance is exactly what let a real failure through
+    uncaught: three identical lines ("шаги." three times) ending the read,
+    replacing everything from that point to the end of the page -- fewer
+    copies than trim_runaway's own cutoff, so it kept all three. What marks
+    this as a loop rather than a legitimate triple is not the count, it is
+    that nothing follows: real content varies from one line to the next,
+    so several identical lines exactly at the end, and nowhere else, is the
+    tell. Returns how many trailing lines to drop, 0 if the ending looks
+    ordinary."""
+    if len(lines) < min_repeats:
+        return 0
+    tail = lines[-1]
+    if not tail.strip():
+        return 0
+    n = 0
+    for line in reversed(lines):
+        if line != tail:
+            break
+        n += 1
+    return n if n >= min_repeats else 0
+
+
 # Any run of eight or more characters repeated three times or more, whatever
 # separates the copies. The first version of this split on commas alone, which
 # caught "снега, снега, снега..." and missed the worse case: a whole sentence
@@ -297,6 +326,10 @@ class PageReader:
         self.processor = AutoProcessor.from_pretrained(MODEL_NAME, local_files_only=local_files_only)
 
         self.adapter_loaded = False
+        # Set by _read_one when a read ends stuck in a repetition loop, so a
+        # caller that wants to know can check it after read_page/read_region
+        # return -- see _read_one and trailing_loop.
+        self.last_read_looped = False
         if adapter_dir and os.path.isfile(os.path.join(adapter_dir, "adapter_config.json")):
             from peft import PeftModel
 
@@ -342,6 +375,7 @@ class PageReader:
         pieces = split_pages(page_bgr)
 
         lines: list[str] = []
+        looped = False
         for i, piece in enumerate(pieces):
             if cancel_event is not None and cancel_event.is_set():
                 break
@@ -353,6 +387,11 @@ class PageReader:
                 prefix = done_so_far + "\n" if done_so_far else ""
                 piece_on_text = lambda t, percent, prefix=prefix: on_text(prefix + t, percent)
             lines.extend(self._read_one(piece, max_new_tokens, cancel_event, piece_on_text))
+            # _read_one sets this per piece; a spread's two pages share one
+            # result, so OR them together rather than let the second piece
+            # silently overwrite the first one's.
+            looped = looped or self.last_read_looped
+        self.last_read_looped = looped
         if progress:
             progress(len(pieces), len(pieces))
         return lines
@@ -392,6 +431,20 @@ class PageReader:
             out[:, prompt_tokens:], skip_special_tokens=True
         )[0].strip()
         lines = trim_runaway([line for line in text.splitlines() if line.strip()])
+
+        # A run of identical lines ending the read with nothing after it --
+        # trim_runaway lets up to max_repeats of these through as possibly
+        # the writer's own doing, but ending on one is not: see
+        # trailing_loop. Dropped rather than kept, since by that point it is
+        # standing in for content that was never actually read.
+        stuck_tail = trailing_loop(lines)
+        if stuck_tail:
+            lines = lines[:-stuck_tail]
+        self.last_read_looped = bool(stuck_tail)
+        if stuck_tail:
+            log.warning(
+                "_read_one: ended stuck on %d repeated line(s) -- rest of page likely missing",
+                stuck_tail)
 
         # Never the handwriting's own content -- see module docstring for
         # what this is for. Lengths and the loop cut, not the letter itself.

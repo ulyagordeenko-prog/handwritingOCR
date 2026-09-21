@@ -992,6 +992,17 @@ class HandwritingApp(tk.Tk):
         texts = read(image, progress=progress, cancel_event=cancel_event, on_text=on_text)
 
         confidences = self._agreement_scores(texts, trocr_lines, trocr_error)
+        if self.page_reader.last_read_looped and confidences:
+            # The cross-check above can only score lines Qwen actually wrote.
+            # A read that ended stuck in a repetition loop (see
+            # page_reader.trailing_loop) already had those repeated lines cut,
+            # so nothing is left in texts for it to catch -- everything the
+            # loop stood in for is simply missing, not merely unsure. The last
+            # remaining line is the one place left to mark: it is where the
+            # read actually broke off.
+            confidences[-1] = 0.0
+            self._events.put(("status",
+                f"{self._page_name}: чтение зациклилось -- конец страницы, возможно, не прочитан"))
         return [
             RecognizedLine(index=i, bbox=(0, 0, 0, 0), text=t, confidence=c, image=None)
             for i, (t, c) in enumerate(zip(texts, confidences))
