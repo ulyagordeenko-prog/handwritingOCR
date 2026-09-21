@@ -1,7 +1,6 @@
 """Проверка фикса зацикливания на странице 101_1011.jpg.
 Запускать через check_5050\run.bat (или из корня проекта: python check_5050\test_loop_fix.py)
 """
-import gc
 import os
 import sys
 import time
@@ -14,7 +13,20 @@ os.chdir(ROOT)
 
 import cv2
 import torch
+import threading
+
+from ocr_project import page_reader
 from ocr_project.page_reader import PageReader
+
+# На карте в 8 ГБ модель идёт около 1 токена в секунду, а штатный предохранитель
+# приложения обрывает чтение через 120 с. Для проверки даём дочитать до конца.
+page_reader.GENERATION_TIMEOUT_S = 2400.0
+
+
+def heartbeat(stop, started):
+    while not stop.wait(60):
+        print(f"  ...идёт чтение, прошло {(time.time() - started) / 60:.0f} мин", flush=True)
+
 
 # то, на что модель обучали: ~1.3 МП на страницу, у разворота две страницы
 SPREAD_PIXEL_BUDGET = 2 * 1280 * 32 * 32
@@ -42,21 +54,18 @@ except Exception as exc:
     print("размер модели узнать не удалось:", exc, flush=True)
 print(f"выделено на карте: {torch.cuda.memory_allocated() / 1024**3:.1f} ГБ", flush=True)
 
-mode = "полный размер"
+# полный размер на карте в 8 ГБ не влезает (проверено), поэтому сразу уменьшаем
+k = min(1.0, (SPREAD_PIXEL_BUDGET / (w * h)) ** 0.5)
+small = cv2.resize(image, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
+mode = f"уменьшено до {small.shape[1]}x{small.shape[0]}"
+print(f"Читаю страницу ({mode}). На этой карте это около 10 минут, окно не закрывайте.", flush=True)
 t = time.time()
+stop = threading.Event()
+threading.Thread(target=heartbeat, args=(stop, t), daemon=True).start()
 try:
-    lines = reader.read_page(image)
-except torch.cuda.OutOfMemoryError as exc:
-    print("\nНЕ ХВАТИЛО ПАМЯТИ на полном размере:", str(exc).split(".")[0], flush=True)
-    del exc
-    gc.collect()
-    torch.cuda.empty_cache()
-    k = (SPREAD_PIXEL_BUDGET / (w * h)) ** 0.5
-    small = cv2.resize(image, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
-    mode = f"уменьшено до {small.shape[1]}x{small.shape[0]}"
-    print(f"Повторяю с уменьшенной картинкой: {mode}", flush=True)
-    t = time.time()
     lines = reader.read_page(small)
+finally:
+    stop.set()
 
 print(f"\nчтение заняло {time.time() - t:.0f} с ({mode})", flush=True)
 print(f"пик памяти: {torch.cuda.max_memory_allocated() / 1024**3:.1f} ГБ", flush=True)
