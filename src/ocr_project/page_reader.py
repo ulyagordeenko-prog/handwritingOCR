@@ -83,6 +83,15 @@ PROMPT = (
 # _recognize_failed.
 GENERATION_TIMEOUT_S = 120.0
 
+# scripts/train_qwen.py's own --max-pixels default -- the size budget the
+# adapter's training data was capped to. Measured on the one page this was
+# built to fix (a photographed spread, two pieces): the piece that looped at
+# full resolution read cleanly once downscaled to this, and the piece that
+# read cleanly at full resolution looped once downscaled -- resolution is not
+# reliably better either way, so read_page tries full size first and only
+# falls back to this, piece by piece, where that piece actually looped.
+RETRY_MAX_PIXELS = 1280 * 32 * 32
+
 # The denominator for the streaming percent shown while Qwen is still
 # generating (see _generate_streamed) -- a rough middle estimate from real
 # transcripts (roughly 800-2000 characters, a few hundred tokens once
@@ -370,6 +379,8 @@ class PageReader:
         front of it, so a spread's second page streams in after the first
         rather than replacing it; percent restarts for each new piece.
         """
+        import cv2
+
         page_bgr, _ = crop_to_page(page_bgr)
         page_bgr, _ = deskew(page_bgr)
         pieces = split_pages(page_bgr)
@@ -386,11 +397,31 @@ class PageReader:
                 done_so_far = "\n".join(lines)
                 prefix = done_so_far + "\n" if done_so_far else ""
                 piece_on_text = lambda t, percent, prefix=prefix: on_text(prefix + t, percent)
-            lines.extend(self._read_one(piece, max_new_tokens, cancel_event, piece_on_text))
-            # _read_one sets this per piece; a spread's two pages share one
-            # result, so OR them together rather than let the second piece
-            # silently overwrite the first one's.
-            looped = looped or self.last_read_looped
+            piece_lines = self._read_one(piece, max_new_tokens, cancel_event, piece_on_text)
+            piece_looped = self.last_read_looped
+
+            # A piece that looped at its own size is retried once, downscaled
+            # to what the adapter trained on -- not because smaller is always
+            # better (it measurably is not: see RETRY_MAX_PIXELS), but because
+            # a piece that already looped has nothing to lose, and the other
+            # size sometimes reads it cleanly where this one could not.
+            h, w = piece.shape[:2]
+            if piece_looped and w * h > RETRY_MAX_PIXELS:
+                k = (RETRY_MAX_PIXELS / (w * h)) ** 0.5
+                smaller = cv2.resize(piece, (int(w * k), int(h * k)), interpolation=cv2.INTER_AREA)
+                retry_lines = self._read_one(smaller, max_new_tokens, cancel_event, piece_on_text)
+                if not self.last_read_looped:
+                    log.info("read_page: retry at %dx%d un-looped a piece that looped at %dx%d",
+                             smaller.shape[1], smaller.shape[0], w, h)
+                    piece_lines, piece_looped = retry_lines, False
+                # else: retry looped too -- keep the original attempt's cut
+                # lines and leave piece_looped True, self.last_read_looped is
+                # already True from the retry call itself.
+
+            lines.extend(piece_lines)
+            # A spread's two pieces share one result, so OR them together
+            # rather than let the second piece silently overwrite the first.
+            looped = looped or piece_looped
         self.last_read_looped = looped
         if progress:
             progress(len(pieces), len(pieces))
