@@ -91,7 +91,16 @@ def read_done(path):
 
 def evaluate(args) -> int:
     import torch
+    from ocr_project import page_reader as page_reader_module
     from ocr_project.page_reader import PageReader
+
+    # The app's own 120s stuck-generation guard is tuned for a live read
+    # someone is watching; an offline batch like this one has nobody to
+    # reassure and a real slow page (especially with page_reader.py's own
+    # retry of a looped piece, which reads it twice) can legitimately run
+    # past that. Raised here, not in page_reader.py itself, since the app
+    # still needs the short fuse.
+    page_reader_module.GENERATION_TIMEOUT_S = 900.0
 
     pages = load_pages(args.holdout, args.bench)
     out_path = f"bench/eval_{args.label}.jsonl"
@@ -124,6 +133,8 @@ def evaluate(args) -> int:
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     record["error"] = "не хватило видеопамяти"
+                except TimeoutError as exc:
+                    record["error"] = f"застряло: {exc}"
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
             shown = (f"{record['cer']:6.1%} за {record['seconds']:.0f} с" if "cer" in record
