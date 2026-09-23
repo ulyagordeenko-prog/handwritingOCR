@@ -47,6 +47,8 @@ bench/
 !scripts/fetch_hwr200.py
 !scripts/setup_server.py
 !scripts/remote.py
+!scripts/remote_check.py
+!scripts/dev_check.py
 !scripts/run_all.sh
 !scripts/pack_results.sh
 
