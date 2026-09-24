@@ -112,6 +112,15 @@ def main() -> int:
     ap.add_argument("--train-out", default="train_pages.jsonl.gz")
     ap.add_argument("--holdout-out", default="holdout_pages.jsonl")
     ap.add_argument("--rotation-flags", default="rotation_flags.jsonl")
+    ap.add_argument("--dedup-cap", type=int, default=None,
+                     help="Cap how many documents sharing the same opening "
+                          "(see document_openings) go into training. Many "
+                          "HWR200 essays answer the same set-topic exam "
+                          "prompts and so open with near-identical passages "
+                          "-- unbounded, the model can learn to recite one "
+                          "of those common openings from memory on a hard "
+                          "page instead of reading it. Unset by default: "
+                          "changes what round 2 already shipped on.")
     args = ap.parse_args()
 
     # Pages the app's users never produce: they photograph their own page
@@ -202,6 +211,29 @@ def main() -> int:
     train = [r for r in rows if r["writer"] not in held_set]
     set_aside = len(rows) - len(train) - len(holdout)
 
+    dropped_dup = 0
+    if args.dedup_cap is not None:
+        # Group by document first (opening_of is a per-document property, but
+        # capping per-page would just thin out one document's own pages
+        # rather than removing whole duplicate copies), then by shared
+        # opening across documents.
+        docs = defaultdict(list)
+        for r in train:
+            docs[(r["writer"], r["document"])].append(r)
+        by_opening = defaultdict(list)
+        for key, doc_rows in docs.items():
+            op = opening_of(doc_rows[0])
+            by_opening[op].append(key)  # op is None for a handful of unmatched documents; left uncapped
+        kept_docs = set()
+        for op, keys in by_opening.items():
+            if op is None or len(keys) <= args.dedup_cap:
+                kept_docs.update(keys)
+            else:
+                kept_docs.update(sorted(keys)[:args.dedup_cap])
+        new_train = [r for r in train if (r["writer"], r["document"]) in kept_docs]
+        dropped_dup = len(train) - len(new_train)
+        train = new_train
+
     with open(args.bench, encoding="utf-8") as f:
         bench_names = {os.path.basename(json.loads(l)["image"].replace("\\", "/")) for l in f}
     bench_notebooks = {notebook_of(n) for n in bench_names}
@@ -230,6 +262,9 @@ def main() -> int:
     print(f"HWR200: страниц {len(rows)}, почерков {len(by_writer)}, "
           f"пометка абзаца убрана на {marked} страницах, "
           f"выброшено как повёрнутые {dropped_rotated}")
+    if args.dedup_cap is not None:
+        print(f"дедупликация (--dedup-cap {args.dedup_cap}): выброшено страниц "
+              f"дублирующихся документов {dropped_dup}")
     print(f"  в обучение {sources['hwr200']}, на проверку {len(holdout)} "
           f"(почерков {len(held)}), не взято {set_aside} -- страницы отложенных почерков "
           f"с текстами, которые писал кто-то ещё")
