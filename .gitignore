@@ -31,9 +31,10 @@ deepseek_out/
 *.log
 *.tar.gz
 
-# Keep only the adapter the app actually loads
+# Keep only the adapters the app actually loads
 checkpoints/*
 !checkpoints/trocr-lora-v5/
+!checkpoints/qwen3vl-hwr200/
 graphify-out/
 bench/
 
